@@ -1601,3 +1601,16 @@ revoke execute on function public.update_profile(text, text, boolean) from publi
 grant execute on function public.update_profile(text, text, boolean) to authenticated;
 
 alter publication supabase_realtime add table public.profiles;
+
+-------------------------------------------------------------------------------
+-- Notifications + web push. Requires the pg_net extension, three vault secrets
+-- (house_line_vapid_private, house_line_vapid_public, house_line_hook_secret),
+-- and the "push" edge function in supabase/functions/push (deployed with
+-- verify_jwt off; it checks x-hook-secret itself). Update the function URL in
+-- private.push_send if you move projects.
+-------------------------------------------------------------------------------
+-- The notification tables, triggers and RPCs are in the project's migrations named
+-- "notifications" and "notifications_number_format" (Supabase → Database → Migrations).
+-- To set up a new project: run those, enable pg_net, create the three vault secrets with
+-- vault.create_secret(...) using a fresh VAPID key pair (npx web-push generate-vapid-keys),
+-- put the new public key in app.js (VAPID_PUBLIC), and deploy supabase/functions/push.

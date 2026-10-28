@@ -178,6 +178,7 @@ async function loadGroupData() {
   for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
   state.loaded = true;
   render();
+  openPendingNotification();
 }
 
 let reloadTimer = null;
@@ -242,8 +243,9 @@ function render() {
   $("#groupName").textContent = group()?.name || "";
   $("#bal").textContent = state.loaded ? fmtTok(myStats().bal) : "—";
   $("#meAvatar").innerHTML = avatarHTML(uid(), 34);
+  paintBell();
   document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === state.tab)));
-  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML, settings: settingsHTML, profile: profileHTML }[state.tab]();
+  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML, settings: settingsHTML, profile: profileHTML, inbox: inboxHTML }[state.tab]();
 }
 
 function setupHTML() {
@@ -984,6 +986,7 @@ function profileHTML() {
       <div><small>Lines posted</small><b class="num">${posted}</b></div>
     </div>
   </section>
+  ${notifySettingsHTML()}
   <section class="set-block"><h3>Account</h3>
     <button class="btn big" id="pfPassword">Change password</button>
     <button class="btn big" id="openSettings">${group()?.owner_id === uid() ? "Group settings" : "Group options"}</button>
@@ -1048,6 +1051,187 @@ function openPassword() {
   };
 }
 
+/* ---------------- notifications ---------------- */
+
+const VAPID_PUBLIC = "BGewTeQH_00NJL5k1zEEzQB8dMu5sEcmr4jb4ycVOyR4OSOeqpnAkpDpd4o1IMIEyw5IrtxbQKC9c6Gxi5gIpEA";
+const NOTIFY_KINDS = [
+  ["new_line", "New lines", "When someone posts a line in your group"],
+  ["result", "Results", "When a bet you're in settles or is voided"],
+  ["action", "Bets on my lines", "When someone bets on a line you posted"],
+  ["settle", "Settle reminders", "When a line you posted closes and needs settling"],
+  ["joined", "New members", "When someone joins a group you own"],
+];
+const KIND_ICON = {
+  result: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/>',
+  new_line: '<path d="M12 5v14M5 12h14"/>',
+  action: '<circle cx="12" cy="12" r="8"/><path d="M12 8v8M9.5 10.5c0-1 1-1.5 2.5-1.5s2.5.6 2.5 1.5-1 1.3-2.5 1.5-2.5.6-2.5 1.5 1 1.5 2.5 1.5 2.5-.5 2.5-1.5"/>',
+  settle: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  joined: '<circle cx="9" cy="8" r="3.5"/><path d="M3 20c0-3.3 2.7-6 6-6s6 2.7 6 6M18 8v6M15 11h6"/>',
+  test: '<path d="M6 8a6 6 0 1 1 12 0c0 7 3 8 3 8H3s3-1 3-8"/>',
+};
+state.notifs = []; state.prefs = {}; state.pushOn = false;
+let notifChannel = null;
+
+async function loadNotifications() {
+  if (!uid()) return;
+  const [n, p] = await Promise.all([
+    sb.from("notifications").select("*").eq("user_id", uid()).order("created_at", { ascending: false }).limit(60),
+    sb.from("profiles").select("notify_prefs").eq("id", uid()).maybeSingle(),
+  ]);
+  state.notifs = n.data || [];
+  state.prefs = p.data?.notify_prefs || {};
+  if (!notifChannel) {
+    notifChannel = sb.channel("notifs-" + uid())
+      .on("postgres_changes", { event: "*", schema: "public", table: "notifications", filter: `user_id=eq.${uid()}` }, () => {
+        clearTimeout(loadNotifications.t); loadNotifications.t = setTimeout(loadNotifications, 300);
+      }).subscribe();
+  }
+  paintBell();
+  if (state.tab === "inbox") render();
+  openPendingNotification();
+}
+const unreadCount = () => state.notifs.filter(n => !n.read_at).length;
+function paintBell() {
+  const c = unreadCount(), el = $("#bellCount");
+  if (!el) return;
+  el.hidden = !c; el.textContent = c > 9 ? "9+" : String(c);
+  try { c ? navigator.setAppBadge?.(c) : navigator.clearAppBadge?.(); } catch {}
+}
+async function markAllRead() {
+  if (!unreadCount()) return;
+  const now = new Date().toISOString();
+  state.notifs = state.notifs.map(n => n.read_at ? n : { ...n, read_at: now, _fresh: true });
+  paintBell();
+  await sb.rpc("mark_notifications_read");
+}
+
+function inboxHTML() {
+  const back = `<button class="btn link back" id="profileBack">‹ Back</button>`;
+  const head = `${back}<div class="props-head"><h2>Notifications</h2>${state.pushOn ? "" : `<button class="btn" id="goNotifySettings">Push settings</button>`}</div>`;
+  if (!state.notifs.length) return head + `<div class="empty"><b>Nothing yet</b>You'll hear about results, new lines, and bets on your lines here.${state.pushOn ? "" : " Turn on push in your profile to get them on your lock screen too."}</div>`;
+  return head + `<div class="inbox">${state.notifs.map(n => {
+    const g = state.groups.find(x => x.id === n.group_id);
+    const tone = n.kind === "result" ? ((n.data?.net ?? 0) > 0 ? "pos" : (n.data?.net ?? 0) < 0 ? "neg" : "") : "";
+    return `<button class="note-row${n._fresh ? " fresh" : ""}" data-notif="${esc(n.id)}">
+      <span class="note-icon ${esc(n.kind)} ${tone}"><svg viewBox="0 0 24 24" aria-hidden="true">${KIND_ICON[n.kind] || KIND_ICON.test}</svg></span>
+      <span class="note-main"><b>${esc(n.title)}</b>${n.body ? `<span>${esc(n.body)}</span>` : ""}
+        <small>${agoText(n.created_at)}${g && state.groups.length > 1 ? ` · ${esc(g.name)}` : ""}</small></span>
+      ${n._fresh ? `<span class="note-dot" aria-label="New"></span>` : ""}
+    </button>`;
+  }).join("")}</div>`;
+}
+
+async function openNotification(id) {
+  const n = state.notifs.find(x => x.id === id); if (!n) return;
+  if (n.group_id && n.group_id !== state.groupId && state.groups.some(g => g.id === n.group_id)) await openGroup(n.group_id);
+  if (n.kind === "joined") { state.tab = "leaders"; return render(); }
+  state.tab = "board";
+  const b = n.bet_id && betById(n.bet_id);
+  state.filter = !b ? "open" : b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
+  render();
+  if (b) setTimeout(() => {
+    const el = document.querySelector(`[data-bet-card="${n.bet_id}"]`);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el?.classList.add("flash"); setTimeout(() => el?.classList.remove("flash"), 1600);
+  }, 80);
+}
+// Tapping a push opens ./?n=<id>; handle it once notifications are loaded.
+let pendingNotif = new URLSearchParams(location.search).get("n");
+function openPendingNotification() {
+  if (!pendingNotif || !state.loaded || !state.notifs.some(n => n.id === pendingNotif)) return;
+  const id = pendingNotif; pendingNotif = null;
+  history.replaceState(null, "", location.pathname);
+  openNotification(id); markAllRead();
+}
+navigator.serviceWorker?.addEventListener("message", e => {
+  if (e.data?.type !== "open") return;
+  pendingNotif = new URL(e.data.url).searchParams.get("n");
+  loadNotifications();
+});
+
+/* push on this device */
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () => window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true;
+const pushSupported = () => "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+function b64ToBytes(s) {
+  const pad = "=".repeat((4 - s.length % 4) % 4), raw = atob((s + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+async function swReg() { return navigator.serviceWorker.register("sw.js"); }
+async function currentSub() {
+  if (!pushSupported()) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+async function saveSub(sub) {
+  const j = sub.toJSON();
+  const { error } = await sb.rpc("save_push_subscription", { p_endpoint: j.endpoint, p_p256dh: j.keys.p256dh, p_auth: j.keys.auth });
+  if (error) throw new Error(errMsg(error));
+}
+// On every sign-in, make sure this device's push address belongs to whoever is signed in.
+async function syncPushSubscription() {
+  try {
+    if (!pushSupported()) return;
+    await swReg();
+    const sub = Notification.permission === "granted" ? await currentSub() : null;
+    state.pushOn = !!sub;
+    if (sub) await saveSub(sub);
+    if (state.tab === "profile" || state.tab === "inbox") render();
+  } catch {}
+}
+async function enablePush() {
+  try {
+    const reg = await swReg(); await navigator.serviceWorker.ready;
+    const perm = await Notification.requestPermission();
+    if (perm !== "granted") { toast("Notifications are blocked. You can allow them in your phone's Settings."); return render(); }
+    const sub = (await reg.pushManager.getSubscription()) || await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64ToBytes(VAPID_PUBLIC) });
+    await saveSub(sub);
+    state.pushOn = true; toast("Push notifications are on for this device"); render();
+  } catch (e) { toast(e.message || "Couldn't turn on notifications"); }
+}
+async function pauseThisDevice() {
+  try {
+    const sub = await currentSub();
+    if (sub) await sb.rpc("pause_push_subscription", { p_endpoint: sub.endpoint });
+  } catch {}
+}
+async function disablePush() {
+  try {
+    const sub = await currentSub();
+    if (sub) { await sb.rpc("pause_push_subscription", { p_endpoint: sub.endpoint }); await sub.unsubscribe(); }
+  } catch {}
+  state.pushOn = false; toast("Push is off for this device"); render();
+}
+
+function notifySettingsHTML() {
+  let device;
+  if (!pushSupported()) {
+    device = isIOS && !isStandalone()
+      ? `<p class="hint"><b>To get notifications on your iPhone,</b> add House Line to your Home Screen first: tap Share, then Add to Home Screen. Open it from the new icon and come back here.</p>`
+      : `<p class="hint">This browser can't receive push notifications. You'll still see them under the bell.</p>`;
+  } else if (Notification.permission === "denied") {
+    device = `<p class="hint">Notifications are blocked for House Line. Turn them on in your phone's Settings → Notifications → House Line, then reload.</p>`;
+  } else if (state.pushOn) {
+    device = `<div class="inline"><span class="push-on">On for this device</span><button class="btn" id="pushTest">Send a test</button><button class="btn link danger-link" id="pushOff">Turn off</button></div>`;
+  } else {
+    device = `<button class="btn primary big" id="pushOn">Turn on push notifications</button><p class="hint">Get results, new lines, and settle reminders on your lock screen.</p>`;
+  }
+  return `<section class="set-block" id="notifySettings"><h3>Notifications</h3>
+    ${device}
+    <div class="toggles">${NOTIFY_KINDS.map(([k, label, hint]) => `
+      <label class="toggle-row" for="nt-${k}"><span><b>${label}</b><small>${hint}</small></span>
+        <input type="checkbox" class="switch" id="nt-${k}" data-pref="${k}" ${state.prefs[k] === false ? "" : "checked"}></label>`).join("")}</div>
+  </section>`;
+}
+
+document.addEventListener("change", async e => {
+  const k = e.target.dataset?.pref; if (!k) return;
+  const on = e.target.checked;
+  state.prefs = { ...state.prefs, [k]: on };
+  const { error } = await sb.rpc("set_notify_pref", { p_kind: k, p_on: on });
+  if (error) { e.target.checked = !on; state.prefs[k] = !on; toast(errMsg(error)); }
+});
+
 /* ---------------- events ---------------- */
 
 function syncDraft() {
@@ -1068,12 +1252,13 @@ $("#tabs").addEventListener("click", e => {
   state.tab = b.dataset.tab; window.scrollTo(0, 0); render();
 });
 $("#groupBtn").addEventListener("click", openGroups);
+$("#bellBtn").addEventListener("click", () => { if (state.tab !== "inbox") state.prevTab = state.tab; state.tab = "inbox"; window.scrollTo(0, 0); render(); markAllRead(); });
 $("#meBtn").addEventListener("click", () => { if (state.tab !== "profile") state.prevTab = state.tab; state.tab = "profile"; window.scrollTo(0, 0); render(); });
 $("#app").addEventListener("input", e => { if (state.tab === "create" && e.target.closest("#createForm")) syncDraft(); });
 
 document.addEventListener("click", async e => {
   const t = e.target.closest("button"); if (!t) return;
-  if (t.id === "signOut") { closeSheet(); await sb.auth.signOut(); return; }
+  if (t.id === "signOut") { closeSheet(); await pauseThisDevice(); await sb.auth.signOut(); return; }
   if (t.id === "a-toggle") { state.authMode = state.authMode === "signup" ? "signin" : "signup"; return render(); }
   if (t.id === "copyCode") {
     const code = group()?.invite_code || "";
@@ -1082,6 +1267,11 @@ document.addEventListener("click", async e => {
   }
   if (t.id === "openSettings") { closeSheet(); state.tab = "settings"; window.scrollTo(0, 0); return render(); }
   if (t.id === "settingsBack") { state.tab = "leaders"; return render(); }
+  if (t.dataset.notif) return openNotification(t.dataset.notif);
+  if (t.id === "goNotifySettings") { state.tab = "profile"; render(); return setTimeout(() => $("#notifySettings")?.scrollIntoView({ behavior: "smooth" }), 50); }
+  if (t.id === "pushOn") return enablePush();
+  if (t.id === "pushOff") return disablePush();
+  if (t.id === "pushTest") { const { error } = await sb.rpc("send_test_notification"); return toast(error ? errMsg(error) : "Test sent. It should arrive in a few seconds."); }
   if (t.id === "profileBack") { state.tab = state.prevTab || "board"; return render(); }
   if (t.id === "pfPhoto") return $("#pf-file").click();
   if (t.id === "pfRemove") return saveProfile({ p_clear_avatar: true }, "Photo removed");
@@ -1213,6 +1403,6 @@ if (sb) {
       Object.assign(state, { groups: [], groupId: null, bets: [], wagers: [], members: [], channel: null });
       return render();
     }
-    if (session.user.id !== was) setTimeout(loadGroups, 0); // defer: don't query inside the auth callback
+    if (session.user.id !== was) setTimeout(() => { loadGroups(); loadNotifications(); syncPushSubscription(); }, 0); // defer: don't query inside the auth callback
   });
 }
