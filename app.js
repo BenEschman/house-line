@@ -143,7 +143,7 @@ const errMsg = e => (e?.message || "Something went wrong. Try again.").replace(/
 
 async function loadGroups() {
   const { data, error } = await sb.from("memberships")
-    .select("group_id, groups(id, name, invite_code, owner_id, starting_balance)").eq("user_id", uid());
+    .select("group_id, groups(id, name, invite_code, owner_id, starting_balance, creator_can_bet)").eq("user_id", uid());
   if (error) { toast(errMsg(error)); return; }
   state.groups = (data || []).map(r => r.groups).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
   const saved = store.get("hl-group");
@@ -317,7 +317,8 @@ function betCard(b) {
   const mine = b.creator_id === uid();
   const prop = propOf(b), myProp = prop?.player_id === uid();
   const closed = isPast(b.closes_at);
-  const canBet = open && !(mine && !b.auto_line) && !myProp && !closed;
+  const ownLineLocked = mine && !b.auto_line && !group()?.creator_can_bet;
+  const canBet = open && !ownLineLocked && !myProp && !closed;
   const hiddenFrom = (state.hidden[b.id] || []).map(nameOf);
   const outs = b.outcomes.map(o => {
     const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
@@ -346,7 +347,7 @@ function betCard(b) {
       ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
       ${prop ? `<p class="note prop-note"><span class="prop-tag">PROP</span>${esc(nameOf(prop.player_id))} · ${esc(prop.stat)}${b.auto_line ? ` <span class="alt-tag">auto line</span>` : ""}</p>` : ""}
       ${myProp && open ? `<p class="note">This prop is about you, so you can't bet on it.</p>` : ""}
-      ${mine && open && !b.auto_line && !myProp ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
+      ${ownLineLocked && open && !myProp ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
       ${liveBar(b, live)}
     </div>
@@ -847,6 +848,8 @@ function settingsHTML() {
     <label class="f" for="set-name">Name<div class="inline"><input class="inp" id="set-name" maxlength="60" value="${esc(g.name)}"><button class="btn" data-set="rename">Save</button></div></label>
     <div class="f">Invite code<div class="inline"><b class="code-show">${esc(g.invite_code)}</b><button class="btn" data-set="newcode">New code</button></div>
       <span class="hint">A new code stops the old one from working. People already in stay in.</span></div>
+    <label class="toggle-row" for="set-ownbet"><span><b>Line creators can bet on their own lines</b><small>Off: whoever posts a line sits it out. Props about yourself are always off-limits.</small></span>
+      <input type="checkbox" class="switch" id="set-ownbet" data-group-toggle="creator_can_bet" ${g.creator_can_bet ? "checked" : ""}></label>
     <label class="f" for="set-start">Starting balance for new members<div class="inline"><input class="inp num" id="set-start" inputmode="numeric" value="${esc(String(g.starting_balance ?? 1000))}"><button class="btn" data-set="startbal">Save</button></div></label>
   </section>
   <section class="set-block"><h3>Members · ${members.length}</h3>
@@ -1225,6 +1228,13 @@ function notifySettingsHTML() {
 }
 
 document.addEventListener("change", async e => {
+  if (e.target.dataset?.groupToggle === "creator_can_bet") {
+    const on = e.target.checked, g = group();
+    const { error } = await sb.rpc("set_creator_can_bet", { p_group: g.id, p_on: on });
+    if (error) { e.target.checked = !on; return toast(errMsg(error)); }
+    g.creator_can_bet = on;
+    return toast(on ? "Line creators can now bet on their own lines" : "Line creators sit out their own lines");
+  }
   const k = e.target.dataset?.pref; if (!k) return;
   const on = e.target.checked;
   state.prefs = { ...state.prefs, [k]: on };
