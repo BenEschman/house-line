@@ -1,0 +1,474 @@
+// House Line — client. Reads go straight to Supabase tables (row-level security
+// limits them to your groups); every write is an RPC defined in supabase/schema.sql.
+
+const cfg = window.HOUSE_LINE_CONFIG || {};
+const configured = cfg.supabaseUrl && !cfg.supabaseUrl.includes("YOUR-PROJECT") && cfg.supabaseAnonKey && !cfg.supabaseAnonKey.includes("YOUR-");
+const sb = configured ? window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey) : null;
+
+const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdds: "-110", underOdds: "-110",
+  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }] });
+
+const state = {
+  session: null, groups: [], groupId: null,
+  bets: [], wagers: [], members: [], loaded: false,
+  tab: "board", filter: "open", authMode: "signin", draft: blankDraft(), channel: null,
+};
+
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtOdds = o => (o > 0 ? "+" : "") + o;
+const fmtTok = n => Math.round(Number(n) || 0).toLocaleString();
+const returns = (stake, odds) => stake + Math.floor(odds > 0 ? stake * odds / 100 : stake * 100 / Math.abs(odds));
+const validOdds = o => Number.isInteger(o) && Math.abs(o) >= 100;
+const uid = () => state.session?.user?.id;
+const group = () => state.groups.find(g => g.id === state.groupId);
+const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { localStorage.setItem(k, v); } catch {} } };
+
+function toast(msg) {
+  const t = document.createElement("div"); t.className = "toast"; t.textContent = msg;
+  $("#toastHost").replaceChildren(t); setTimeout(() => t.remove(), 2400);
+}
+const errMsg = e => (e?.message || "Something went wrong. Try again.").replace(/^.*?ERROR:\s*/, "");
+
+/* ---------------- data ---------------- */
+
+async function loadGroups() {
+  const { data, error } = await sb.from("memberships")
+    .select("group_id, groups(id, name, invite_code, owner_id)").eq("user_id", uid());
+  if (error) { toast(errMsg(error)); return; }
+  state.groups = (data || []).map(r => r.groups).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
+  const saved = store.get("hl-group");
+  const pick = state.groups.find(g => g.id === saved) || state.groups[0];
+  if (pick) await openGroup(pick.id); else { state.groupId = null; render(); }
+}
+
+async function openGroup(id) {
+  state.groupId = id; store.set("hl-group", id);
+  state.loaded = false; state.tab = "board"; render();
+  await loadGroupData();
+  subscribe(id);
+}
+
+async function loadGroupData() {
+  const gid = state.groupId; if (!gid) return;
+  const [bets, wagers, members] = await Promise.all([
+    sb.from("bets").select("*, outcomes(id, label, odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
+    sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
+    sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
+  ]);
+  if (gid !== state.groupId) return;
+  const err = bets.error || wagers.error || members.error;
+  if (err) toast(errMsg(err));
+  state.bets = (bets.data || []).map(b => ({ ...b, outcomes: (b.outcomes || []).sort((x, y) => x.position - y.position) }));
+  state.wagers = wagers.data || [];
+  state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player" }));
+  state.loaded = true;
+  render();
+}
+
+let reloadTimer = null;
+function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(loadGroupData, 250); }
+
+function subscribe(gid) {
+  if (state.channel) sb.removeChannel(state.channel);
+  const ch = sb.channel("group-" + gid);
+  for (const table of ["bets", "outcomes", "wagers", "memberships"])
+    ch.on("postgres_changes", { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
+  ch.subscribe();
+  state.channel = ch;
+}
+// Catch up after the phone wakes or the tab comes back.
+document.addEventListener("visibilitychange", () => { if (!document.hidden && state.groupId) loadGroupData(); });
+
+/* ---------------- derived ---------------- */
+
+const me = () => state.members.find(m => m.id === uid());
+const nameOf = id => id === uid() ? "You" : (state.members.find(m => m.id === id)?.username || "player");
+const betById = id => state.bets.find(b => b.id === id);
+const canManage = b => b.creator_id === uid() || group()?.owner_id === uid();
+
+function myStats() {
+  let risk = 0, won = 0, lost = 0;
+  for (const w of state.wagers) {
+    if (w.user_id !== uid()) continue;
+    const b = betById(w.bet_id);
+    if (w.payout == null) risk += w.stake;
+    else if (b?.status === "settled") (w.payout > 0 ? won++ : lost++);
+  }
+  return { bal: me()?.balance ?? 0, risk, won, lost };
+}
+function recordOf(id) {
+  let won = 0, lost = 0, risk = 0;
+  for (const w of state.wagers) if (w.user_id === id) {
+    if (w.payout == null) risk += w.stake;
+    else if (betById(w.bet_id)?.status === "settled") (w.payout > 0 ? won++ : lost++);
+  }
+  return { won, lost, risk };
+}
+
+/* ---------------- render ---------------- */
+
+function render() {
+  const app = $("#app");
+  const inGroup = !!(state.session && state.groupId);
+  $("#top").hidden = !inGroup; $("#tabs").hidden = !inGroup;
+  app.classList.toggle("solo", !inGroup);
+  if (!configured) { app.innerHTML = setupHTML(); return; }
+  if (!state.session) { app.innerHTML = authHTML(); return; }
+  if (!state.groupId) { app.innerHTML = noGroupHTML(); return; }
+  $("#groupName").textContent = group()?.name || "";
+  $("#bal").textContent = state.loaded ? fmtTok(myStats().bal) : "—";
+  document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === state.tab)));
+  app.innerHTML = { board: boardHTML, create: createHTML, slip: slipHTML, leaders: leadersHTML }[state.tab]();
+}
+
+function setupHTML() {
+  return `<h1>House<span>Line</span></h1>
+  <p class="lede">Almost there. This copy isn’t connected to a database yet.</p>
+  <div class="form"><b>Finish setup</b><span class="hint">Open <code>config.js</code> and paste your Supabase project URL and anon key. The README walks through it.</span></div>`;
+}
+
+function authHTML() {
+  const up = state.authMode === "signup";
+  return `<h1>House<span>Line</span></h1>
+  <p class="lede">Make lines. Take action. Play money only.</p>
+  <form class="form" id="authForm">
+    ${up ? `<label class="f" for="a-user">Username<input class="inp" id="a-user" autocomplete="username" maxlength="20" placeholder="benny" required></label>` : ""}
+    <label class="f" for="a-email">Email<input class="inp" id="a-email" type="email" autocomplete="email" required></label>
+    <label class="f" for="a-pass">Password<input class="inp" id="a-pass" type="password" autocomplete="${up ? "new-password" : "current-password"}" minlength="6" required></label>
+    <div class="err" id="a-err"></div>
+    <button class="btn primary big" type="submit">${up ? "Create account" : "Sign in"}</button>
+    <button class="btn link" type="button" id="a-toggle">${up ? "Have an account? Sign in" : "New here? Create an account"}</button>
+  </form>`;
+}
+
+function noGroupHTML() {
+  return `<h1>House<span>Line</span></h1>
+  <p class="lede">Bets live inside a group. Join your friends’ group with their invite code, or start one.</p>
+  ${joinCreateForms()}
+  <button class="btn link" id="signOut" style="margin-top:18px">Sign out</button>`;
+}
+function joinCreateForms() {
+  return `<form class="form" id="joinForm">
+    <label class="f" for="j-code">Invite code<input class="inp code" id="j-code" maxlength="6" autocomplete="off" autocapitalize="characters" placeholder="K7Q2MX" required></label>
+    <div class="err" id="j-err"></div>
+    <button class="btn primary big" type="submit">Join group</button>
+  </form>
+  <div class="divider">or</div>
+  <form class="form" id="newGroupForm">
+    <label class="f" for="g-name">New group name<input class="inp" id="g-name" maxlength="60" placeholder="Friday night crew" required></label>
+    <span class="hint">Everyone who joins starts with 1,000 tokens.</span>
+    <div class="err" id="g-err"></div>
+    <button class="btn big" type="submit">Create group</button>
+  </form>`;
+}
+
+function poolFor(betId) {
+  const pool = {};
+  for (const w of state.wagers) if (w.bet_id === betId) pool[w.outcome_id] = (pool[w.outcome_id] || 0) + w.stake;
+  return pool;
+}
+
+function boardHTML() {
+  const bucket = b => b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
+  const counts = { open: 0, locked: 0, done: 0 };
+  state.bets.forEach(b => counts[bucket(b)]++);
+  const shown = state.bets.filter(b => bucket(b) === state.filter);
+  const seg = `<div class="seg" role="group" aria-label="Filter bets">${[["open", "Open"], ["locked", "Locked"], ["done", "Settled"]]
+    .map(([k, l]) => `<button data-filter="${k}" aria-pressed="${state.filter === k}">${l} · ${counts[k]}</button>`).join("")}</div>`;
+  if (!state.loaded) return seg + `<div class="empty"><b>Loading the board…</b></div>`;
+  if (!shown.length) return seg + (state.filter === "open"
+    ? `<div class="empty"><b>No open bets yet</b>Tap New bet to post the first line, like “Jake finishes the burrito, O/U 12.5 min.”</div>`
+    : `<div class="empty"><b>Nothing here yet</b>Bets move here when their creator locks or settles them.</div>`);
+  return seg + `<div class="list">${shown.map(betCard).join("")}</div>`;
+}
+
+function betCard(b) {
+  const pool = poolFor(b.id);
+  const mineBy = {};
+  for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid()) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
+  const open = b.status === "open";
+  const outs = b.outcomes.map(o => {
+    const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
+    return `<button class="out ${cls}" data-bet="${esc(b.id)}" data-out="${esc(o.id)}" ${open ? "" : "disabled"}>
+      <span class="lbl">${esc(o.label)}</span>
+      <span class="odds num">${fmtOdds(o.odds)}</span>
+      <span class="pool num">${fmtTok(pool[o.id] || 0)} wagered${cls === "won" ? " · winner" : ""}</span>
+      ${mineBy[o.id] ? `<span class="mine num">You: ${fmtTok(mineBy[o.id])}</span>` : ""}
+    </button>`;
+  }).join("");
+  const live = b.status === "open" || b.status === "locked";
+  const ctl = live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
+      ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
+      <button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button>
+      <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
+  return `<article class="bet">
+    <div class="bet-head">
+      <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
+      <h3>${esc(b.title)}</h3>
+      ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
+    </div>
+    <div class="outs">${outs}</div>${ctl}
+  </article>`;
+}
+
+function createHTML() {
+  const d = state.draft, ou = d.type === "ou";
+  const typeSeg = `<div class="seg" role="group" aria-label="Bet type">${[["ou", "Over / Under"], ["custom", "Custom outcomes"]]
+    .map(([k, l]) => `<button type="button" data-type="${k}" aria-pressed="${d.type === k}">${l}</button>`).join("")}</div>`;
+  const body = ou ? `
+    <label class="f" for="c-line">Line<input class="inp num" id="c-line" inputmode="decimal" placeholder="12.5" value="${esc(d.line)}"><span class="hint">Use a .5 so nobody pushes.</span></label>
+    <div class="orow two">
+      <label class="f" for="c-over">Over odds<input class="inp num" id="c-over" inputmode="numeric" value="${esc(d.overOdds)}"></label>
+      <label class="f" for="c-under">Under odds<input class="inp num" id="c-under" inputmode="numeric" value="${esc(d.underOdds)}"></label>
+    </div>` : `
+    <div class="f">Outcomes &amp; odds
+      <div class="list" style="gap:8px">${d.outcomes.map((o, i) => `
+        <div class="orow">
+          <input class="inp" id="c-ol-${i}" data-ol="${i}" maxlength="60" placeholder="Outcome ${i + 1}" value="${esc(o.label)}" aria-label="Outcome ${i + 1}">
+          <input class="inp num" id="c-oo-${i}" data-oo="${i}" inputmode="numeric" placeholder="+150" value="${esc(o.odds)}" aria-label="Odds for outcome ${i + 1}">
+          <button type="button" class="x" data-rm="${i}" aria-label="Remove outcome ${i + 1}" ${d.outcomes.length <= 2 ? "disabled" : ""}>×</button>
+        </div>`).join("")}</div>
+      <button type="button" class="btn" id="c-add" style="align-self:flex-start;margin-top:4px" ${d.outcomes.length >= 8 ? "disabled" : ""}>+ Add outcome</button>
+      <span class="hint">−150 means risk 150 to win 100. +200 means risk 100 to win 200.</span>
+    </div>`;
+  return `<h2>Post a line</h2>${typeSeg}
+  <form class="form" id="createForm">
+    <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
+    <label class="f" for="c-detail">Details (optional)<input class="inp" id="c-detail" maxlength="240" placeholder="Settled by stopwatch at the table" value="${esc(d.detail)}"></label>
+    ${body}
+    <div class="err" id="c-err"></div>
+    <button class="btn primary big" type="submit">Post bet</button>
+  </form>`;
+}
+
+function slipHTML() {
+  const s = myStats();
+  const ws = state.wagers.filter(w => w.user_id === uid()).sort((a, b) => b.created_at.localeCompare(a.created_at));
+  const stats = `<div class="stats">
+    <div class="stat"><small>Balance</small><b class="num">${fmtTok(s.bal)}</b></div>
+    <div class="stat"><small>At risk</small><b class="num">${fmtTok(s.risk)}</b></div>
+    <div class="stat"><small>Record</small><b class="num">${s.won}–${s.lost}</b></div></div>`;
+  if (!ws.length) return `<h2>My slip</h2>${stats}<div class="empty"><b>No wagers yet</b>Tap any odds on the board to bet.</div>`;
+  return `<h2>My slip</h2>${stats}<div class="list">${ws.map(w => {
+    const b = betById(w.bet_id); const o = b?.outcomes.find(x => x.id === w.outcome_id);
+    let right, status;
+    if (w.payout == null) { status = "pending"; right = `<span>to win ${fmtTok(returns(w.stake, w.odds) - w.stake)}</span>`; }
+    else if (b?.status === "void") { status = "voided"; right = `<span>refunded</span>`; }
+    else if (w.payout > 0) { status = "won"; right = `<span class="pos">+${fmtTok(w.payout - w.stake)}</span>`; }
+    else { status = "lost"; right = `<span class="neg">−${fmtTok(w.stake)}</span>`; }
+    return `<div class="row"><div class="main"><div class="t">${esc(o?.label || "Outcome")} <span class="num" style="color:var(--felt)">${fmtOdds(w.odds)}</span></div>
+      <div class="s">${esc(b?.title || "Bet")} · ${fmtTok(w.stake)} staked · ${status}</div></div><div class="amt num">${right}</div></div>`;
+  }).join("")}</div>`;
+}
+
+function leadersHTML() {
+  const g = group();
+  const rows = [...state.members].sort((a, b) => b.balance - a.balance);
+  const invite = g ? `<div class="invite"><div><small>Invite code</small><b>${esc(g.invite_code)}</b></div>
+    <button class="btn" id="copyCode">Copy</button></div>` : "";
+  return `<h2>Leaderboard</h2>${invite}<div class="list">${rows.map((r, i) => {
+    const rec = recordOf(r.id);
+    return `<div class="row"><div class="rank num">${i + 1}</div><div class="initial">${esc((r.username[0] || "?").toUpperCase())}</div>
+      <div class="main"><div class="t">${esc(r.id === uid() ? r.username + " (you)" : r.username)}</div><div class="s num">${rec.won}–${rec.lost} · ${fmtTok(rec.risk)} at risk</div></div>
+      <div class="amt num">${fmtTok(r.balance)}</div></div>`;
+  }).join("")}</div>`;
+}
+
+/* ---------------- sheets ---------------- */
+
+function sheet(html) {
+  $("#sheetHost").innerHTML = `<div class="scrim" id="scrim"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`;
+  $("#scrim").addEventListener("click", e => { if (e.target.id === "scrim" || e.target.closest("[data-close]")) closeSheet(); });
+}
+function closeSheet() { $("#sheetHost").innerHTML = ""; }
+
+function openWager(betId, outId) {
+  const b = betById(betId); const o = b?.outcomes.find(x => x.id === outId);
+  if (!b || !o) return;
+  const bal = myStats().bal;
+  sheet(`<h4>${esc(b.title)}</h4>
+    <div class="pick"><b>${esc(o.label)}</b><span class="odds num">${fmtOdds(o.odds)}</span></div>
+    <label class="f" for="stake">Stake · ${fmtTok(bal)} available<input class="inp num" id="stake" inputmode="numeric" placeholder="0" autocomplete="off"></label>
+    <div class="chips">${[10, 50, 100, 250].map(v => `<button data-chip="${v}">${v}</button>`).join("")}<button data-chip="${Math.floor(bal)}">All in</button></div>
+    <div class="payout"><span>Returns</span><b class="num" id="ret">0</b></div>
+    <div class="err" id="s-err"></div>
+    <button class="btn primary big" id="place">Place wager</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  const input = $("#stake");
+  const upd = () => { const v = Math.floor(Number(input.value) || 0); $("#ret").textContent = fmtTok(v > 0 ? returns(v, o.odds) : 0); };
+  input.addEventListener("input", upd);
+  document.querySelectorAll("[data-chip]").forEach(c => c.onclick = () => { input.value = c.dataset.chip; upd(); });
+  $("#place").onclick = async () => {
+    const stake = Math.floor(Number(input.value) || 0);
+    if (stake < 1) return ($("#s-err").textContent = "Enter at least 1 token.");
+    $("#place").disabled = true;
+    const { error } = await sb.rpc("place_wager", { p_outcome: outId, p_stake: stake });
+    if (error) { $("#s-err").textContent = errMsg(error); $("#place").disabled = false; return; }
+    closeSheet(); toast(`Bet ${fmtTok(stake)} on ${o.label}`); loadGroupData();
+  };
+  input.focus();
+}
+
+function openSettle(betId) {
+  const b = betById(betId); if (!b) return;
+  sheet(`<h4>Settle: ${esc(b.title)}</h4><b>Which outcome hit?</b>
+    <div class="list" style="gap:8px">${b.outcomes.map(o => `<button class="btn big" data-win="${esc(o.id)}">${esc(o.label)}</button>`).join("")}</div>
+    <div class="err" id="st-err"></div>
+    <button class="btn big" data-close>Cancel</button>`);
+  document.querySelectorAll("[data-win]").forEach(btn => btn.onclick = async () => {
+    btn.disabled = true;
+    const { error } = await sb.rpc("settle_bet", { p_bet: betId, p_winner: btn.dataset.win });
+    if (error) { $("#st-err").textContent = errMsg(error); btn.disabled = false; return; }
+    closeSheet(); toast("Settled. Winners are paid."); loadGroupData();
+  });
+}
+
+function openVoid(betId) {
+  const b = betById(betId); if (!b) return;
+  sheet(`<h4>Void bet</h4><b>${esc(b.title)}</b>
+    <span class="hint">Every stake on this bet is refunded and the bet closes for good.</span>
+    <div class="err" id="v-err"></div>
+    <button class="btn big danger" id="confirmVoid">Void and refund</button>
+    <button class="btn big" data-close>Keep it</button>`);
+  $("#confirmVoid").onclick = async () => {
+    const { error } = await sb.rpc("void_bet", { p_bet: betId });
+    if (error) return ($("#v-err").textContent = errMsg(error));
+    closeSheet(); toast("Voided. Stakes refunded."); loadGroupData();
+  };
+}
+
+function openGroups() {
+  sheet(`<h4>Your groups</h4>
+    <div class="list" style="gap:8px">${state.groups.map(g => `
+      <button class="row ${g.id === state.groupId ? "current" : ""}" data-group="${esc(g.id)}" style="text-align:left">
+        <div class="main"><div class="t">${esc(g.name)}</div><div class="s">Code ${esc(g.invite_code)}</div></div></button>`).join("")}</div>
+    <div class="divider">add a group</div>
+    ${joinCreateForms()}
+    <button class="btn link" id="signOut">Sign out</button>`);
+  document.querySelectorAll("[data-group]").forEach(b => b.onclick = () => { closeSheet(); openGroup(b.dataset.group); });
+}
+
+/* ---------------- events ---------------- */
+
+function syncDraft() {
+  const d = state.draft, v = id => document.getElementById(id)?.value;
+  for (const [id, key] of [["c-title", "title"], ["c-detail", "detail"], ["c-line", "line"], ["c-over", "overOdds"], ["c-under", "underOdds"]])
+    if (v(id) !== undefined) d[key] = v(id);
+  document.querySelectorAll("[data-ol]").forEach(el => d.outcomes[+el.dataset.ol].label = el.value);
+  document.querySelectorAll("[data-oo]").forEach(el => d.outcomes[+el.dataset.oo].odds = el.value);
+}
+
+$("#tabs").addEventListener("click", e => {
+  const b = e.target.closest("button[data-tab]"); if (!b) return;
+  if (state.tab === "create") syncDraft();
+  state.tab = b.dataset.tab; window.scrollTo(0, 0); render();
+});
+$("#groupBtn").addEventListener("click", openGroups);
+$("#app").addEventListener("input", e => { if (state.tab === "create" && e.target.closest("#createForm")) syncDraft(); });
+
+document.addEventListener("click", async e => {
+  const t = e.target.closest("button"); if (!t) return;
+  if (t.id === "signOut") { closeSheet(); await sb.auth.signOut(); return; }
+  if (t.id === "a-toggle") { state.authMode = state.authMode === "signup" ? "signin" : "signup"; return render(); }
+  if (t.id === "copyCode") {
+    const code = group()?.invite_code || "";
+    try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
+    return;
+  }
+  if (!t.closest("#app")) return;
+  if (t.dataset.filter) { state.filter = t.dataset.filter; return render(); }
+  if (t.dataset.type) { syncDraft(); state.draft.type = t.dataset.type; return render(); }
+  if (t.id === "c-add") { syncDraft(); state.draft.outcomes.push({ label: "", odds: "+100" }); return render(); }
+  if (t.dataset.rm) { syncDraft(); state.draft.outcomes.splice(+t.dataset.rm, 1); return render(); }
+  if (t.dataset.out && !t.disabled) return openWager(t.dataset.bet, t.dataset.out);
+  if (t.dataset.act === "settle") return openSettle(t.dataset.bet);
+  if (t.dataset.act === "void") return openVoid(t.dataset.bet);
+  if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
+    const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });
+    if (error) return toast(errMsg(error));
+    toast(t.dataset.act === "lock" ? "Locked. No more wagers." : "Reopened."); loadGroupData();
+  }
+});
+
+document.addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target, btn = f.querySelector("button[type=submit]");
+  const busy = on => { if (btn) btn.disabled = on; };
+
+  if (f.id === "authForm") {
+    const email = $("#a-email").value.trim(), password = $("#a-pass").value, err = $("#a-err");
+    busy(true); err.textContent = "";
+    if (state.authMode === "signup") {
+      const username = $("#a-user").value.trim();
+      if (!/^[A-Za-z0-9_]{2,20}$/.test(username)) { busy(false); return (err.textContent = "Username: 2–20 letters, numbers, or underscores."); }
+      const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username } } });
+      busy(false);
+      if (error) return (err.textContent = errMsg(error));
+      if (!data.session) { err.className = "ok"; err.textContent = "Check your email for a confirmation link, then sign in."; state.authMode = "signin"; }
+    } else {
+      const { error } = await sb.auth.signInWithPassword({ email, password });
+      busy(false);
+      if (error) err.textContent = errMsg(error);
+    }
+    return;
+  }
+
+  if (f.id === "joinForm") {
+    const err = f.querySelector(".err"); busy(true);
+    const { data, error } = await sb.rpc("join_group", { p_code: f.querySelector("#j-code").value });
+    busy(false);
+    if (error) return (err.textContent = errMsg(error));
+    closeSheet(); store.set("hl-group", data.id); toast(`Joined ${data.name}`); return loadGroups();
+  }
+
+  if (f.id === "newGroupForm") {
+    const err = f.querySelector(".err"); busy(true);
+    const { data, error } = await sb.rpc("create_group", { p_name: f.querySelector("#g-name").value });
+    busy(false);
+    if (error) return (err.textContent = errMsg(error));
+    closeSheet(); store.set("hl-group", data.id); toast(`Created ${data.name}. Share code ${data.invite_code}`); return loadGroups();
+  }
+
+  if (f.id === "createForm") {
+    syncDraft();
+    const d = state.draft, err = $("#c-err");
+    const title = d.title.trim();
+    if (!title) return (err.textContent = "Give the bet a name.");
+    let outcomes, line = null;
+    if (d.type === "ou") {
+      const L = Number(d.line), ov = Number(d.overOdds), un = Number(d.underOdds);
+      if (!d.line.trim() || !Number.isFinite(L)) return (err.textContent = "Set a number for the line, like 12.5.");
+      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +120).");
+      line = L;
+      outcomes = [{ label: `Over ${L}`, odds: ov }, { label: `Under ${L}`, odds: un }];
+    } else {
+      outcomes = d.outcomes.map(o => ({ label: o.label.trim(), odds: Number(o.odds) }));
+      if (outcomes.some(o => !o.label)) return (err.textContent = "Every outcome needs a name.");
+      if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +250).");
+    }
+    busy(true);
+    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes });
+    busy(false);
+    if (error) return (err.textContent = errMsg(error));
+    state.draft = { ...blankDraft(), type: d.type };
+    state.tab = "board"; state.filter = "open"; toast("Bet posted"); loadGroupData();
+  }
+});
+
+/* ---------------- boot ---------------- */
+
+render();
+if (sb) {
+  sb.auth.onAuthStateChange((event, session) => {
+    const was = uid();
+    state.session = session;
+    if (!session) {
+      if (state.channel) sb.removeChannel(state.channel);
+      Object.assign(state, { groups: [], groupId: null, bets: [], wagers: [], members: [], channel: null });
+      return render();
+    }
+    if (session.user.id !== was) setTimeout(loadGroups, 0); // defer: don't query inside the auth callback
+  });
+}
