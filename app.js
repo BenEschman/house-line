@@ -143,7 +143,7 @@ const errMsg = e => (e?.message || "Something went wrong. Try again.").replace(/
 
 async function loadGroups() {
   const { data, error } = await sb.from("memberships")
-    .select("group_id, groups(id, name, invite_code, owner_id)").eq("user_id", uid());
+    .select("group_id, groups(id, name, invite_code, owner_id, starting_balance)").eq("user_id", uid());
   if (error) { toast(errMsg(error)); return; }
   state.groups = (data || []).map(r => r.groups).filter(Boolean).sort((a, b) => a.name.localeCompare(b.name));
   const saved = store.get("hl-group");
@@ -234,7 +234,7 @@ function render() {
   $("#groupName").textContent = group()?.name || "";
   $("#bal").textContent = state.loaded ? fmtTok(myStats().bal) : "—";
   document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === state.tab)));
-  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML }[state.tab]();
+  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML, settings: settingsHTML }[state.tab]();
 }
 
 function setupHTML() {
@@ -592,7 +592,7 @@ function slipHTML() {
 function leadersHTML() {
   const g = group();
   const rows = [...state.members].sort((a, b) => b.balance - a.balance);
-  const invite = g ? `<div class="invite"><div><small>Invite code</small><b>${esc(g.invite_code)}</b></div>
+  const invite = (g && g.owner_id === uid() ? `<button class="btn settings-link" id="openSettings">⚙ Group settings</button>` : "") + (g ? `<div class="invite"><div><small>Invite code</small><b>${esc(g.invite_code)}</b></div>
     <button class="btn" id="copyCode">Copy</button></div>` : "";
   return `<h2>Leaderboard</h2>${invite}<div class="list">${rows.map((r, i) => {
     const rec = recordOf(r.id);
@@ -812,10 +812,128 @@ function openGroups() {
     <div class="list" style="gap:8px">${state.groups.map(g => `
       <button class="row ${g.id === state.groupId ? "current" : ""}" data-group="${esc(g.id)}" style="text-align:left">
         <div class="main"><div class="t">${esc(g.name)}</div><div class="s">Code ${esc(g.invite_code)}</div></div></button>`).join("")}</div>
+    <button class="btn big" id="openSettings">${group()?.owner_id === uid() ? "Group settings" : "Group options"}</button>
     <div class="divider">add a group</div>
     ${joinCreateForms()}
     <button class="btn link" id="signOut">Sign out</button>`);
   document.querySelectorAll("[data-group]").forEach(b => b.onclick = () => { closeSheet(); openGroup(b.dataset.group); });
+}
+
+/* ---------------- group settings ---------------- */
+
+function settingsHTML() {
+  const g = group(); if (!g) return "";
+  const owner = g.owner_id === uid();
+  const back = `<button class="btn link back" id="settingsBack">‹ Back</button>`;
+  if (!owner) return `${back}<h2>Group options</h2>
+    <section class="set-block"><h3>${esc(g.name)}</h3><p class="hint">Owned by ${esc(nameOf(g.owner_id))}. Only the owner can change settings.</p>
+      <button class="btn danger big" data-set="leave">Leave group</button>
+      <p class="hint">Leaving removes your wagers on bets that haven't settled yet, and your props.</p></section>`;
+  const members = [...state.members].sort((a, b) => a.username.localeCompare(b.username));
+  const stats = statGroups();
+  return `${back}<h2>Group settings</h2>
+  <section class="set-block"><h3>Group</h3>
+    <label class="f" for="set-name">Name<div class="inline"><input class="inp" id="set-name" maxlength="60" value="${esc(g.name)}"><button class="btn" data-set="rename">Save</button></div></label>
+    <div class="f">Invite code<div class="inline"><b class="code-show">${esc(g.invite_code)}</b><button class="btn" data-set="newcode">New code</button></div>
+      <span class="hint">A new code stops the old one from working. People already in stay in.</span></div>
+    <label class="f" for="set-start">Starting balance for new members<div class="inline"><input class="inp num" id="set-start" inputmode="numeric" value="${esc(String(g.starting_balance ?? 1000))}"><button class="btn" data-set="startbal">Save</button></div></label>
+  </section>
+  <section class="set-block"><h3>Members · ${members.length}</h3>
+    <div class="set-list">${members.map(m => `
+      <div class="set-row"><div class="main"><b>${esc(m.username)}${m.id === uid() ? " (you)" : ""}</b><span class="s num">${fmtTok(m.balance)} tokens${m.id === g.owner_id ? " · owner" : ""}</span></div>
+        <div class="acts">
+          <button class="btn" data-set="tokens" data-user="${esc(m.id)}">Tokens</button>
+          ${m.id !== uid() ? `<button class="btn" data-set="owner" data-user="${esc(m.id)}">Make owner</button>
+          <button class="btn danger" data-set="remove" data-user="${esc(m.id)}">Remove</button>` : ""}
+        </div></div>`).join("")}</div>
+  </section>
+  <section class="set-block"><h3>Props</h3>
+    ${stats.length ? stats.map(sg => `<div class="set-stat">
+      <div class="set-row"><div class="main"><b>${esc(sg.stat)}</b><span class="s">${sg.props.length} players</span></div>
+        <div class="acts"><button class="btn danger" data-set="delstat" data-stat="${esc(sg.stat)}">Delete stat</button></div></div>
+      <div class="chips">${sg.props.map(pr => `<button type="button" class="x-chip" data-set="delprop" data-prop="${esc(pr.id)}" aria-label="Remove ${esc(nameOf(pr.player_id))}'s ${esc(sg.stat)} prop">${esc(nameOf(pr.player_id))} ×</button>`).join("")}</div>
+    </div>`).join("") : `<p class="hint">No props yet. Add them from the Props tab.</p>`}
+    <p class="hint">Deleting a prop keeps its past and current bets on the board. They just stop being linked to the prop.</p>
+  </section>
+  <section class="set-block"><h3>New season</h3>
+    <p class="hint">Put everyone back to ${fmtTok(g.starting_balance ?? 1000)} tokens. Settle or void open bets first.</p>
+    <button class="btn" data-set="reset">Reset all balances</button>
+  </section>
+  <section class="set-block danger-zone"><h3>Delete group</h3>
+    <p class="hint">Deletes every bet, wager, prop and balance in ${esc(g.name)} for everyone. This can't be undone.</p>
+    <label class="f" for="set-del">Type the group name to confirm<input class="inp" id="set-del" placeholder="${esc(g.name)}" autocomplete="off"></label>
+    <button class="btn danger big" data-set="delgroup">Delete ${esc(g.name)}</button>
+  </section>`;
+}
+
+function confirmSheet(title, body, action, danger, run) {
+  sheet(`<h4>${esc(title)}</h4><p class="sheet-body">${body}</p>
+    <div class="err" id="cf-err"></div>
+    <button class="btn big ${danger ? "danger" : "primary"}" id="cf-go">${esc(action)}</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  $("#cf-go").onclick = async () => {
+    $("#cf-go").disabled = true;
+    const msg = await run();
+    if (msg) { $("#cf-err").textContent = msg; $("#cf-go").disabled = false; return; }
+    closeSheet();
+  };
+}
+
+async function settingsAction(t) {
+  const g = group(), gid = g.id, act = t.dataset.set, who = t.dataset.user, name = who ? nameOf(who) : "";
+  const call = async (fn, args, ok) => {
+    const { data, error } = await sb.rpc(fn, args);
+    if (error) {
+      const m = errMsg(error);
+      return /could not find the function|schema cache/i.test(m) ? "Settings aren't switched on yet. Run supabase/owner_settings.sql in Supabase first." : m;
+    }
+    toast(typeof ok === "function" ? ok(data) : ok);
+    await loadGroups(); state.tab = "settings"; render();
+    return "";
+  };
+  const inline = async (fn, args, ok) => { const m = await call(fn, args, ok); if (m) toast(m); };
+  if (act === "rename") return inline("rename_group", { p_group: gid, p_name: $("#set-name").value }, "Group renamed");
+  if (act === "newcode") return confirmSheet("New invite code?", `The current code <b>${esc(g.invite_code)}</b> stops working. Everyone already in the group stays.`, "Make new code", false,
+    () => call("new_invite_code", { p_group: gid }, c => `New code: ${c}`));
+  if (act === "startbal") return inline("set_starting_balance", { p_group: gid, p_amount: Math.floor(Number($("#set-start").value)) }, "Starting balance saved");
+  if (act === "tokens") {
+    sheet(`<h4>Tokens for ${esc(name)}</h4><b class="num">${fmtTok(state.members.find(m => m.id === who)?.balance)} now</b>
+      <label class="f" for="tk-amt">Amount<input class="inp num" id="tk-amt" inputmode="numeric" placeholder="100"></label>
+      <div class="err" id="tk-err"></div>
+      <div class="orow two"><button class="btn big primary" id="tk-give">Give</button><button class="btn big danger" id="tk-take">Take</button></div>
+      <button class="btn big" data-close>Cancel</button>`);
+    const go = async sign => {
+      const amt = Math.floor(Number($("#tk-amt").value));
+      if (!(amt > 0)) return ($("#tk-err").textContent = "Enter an amount.");
+      const m = await call("adjust_balance", { p_group: gid, p_user: who, p_delta: sign * amt }, nb => `${name} now has ${fmtTok(nb)} tokens`);
+      if (m) $("#tk-err").textContent = m; else closeSheet();
+    };
+    $("#tk-give").onclick = () => go(1); $("#tk-take").onclick = () => go(-1);
+    return;
+  }
+  if (act === "owner") return confirmSheet(`Make ${name} the owner?`, `${esc(name)} gets these settings and you become a regular member. Only they can give it back.`, `Make ${name} owner`, false,
+    () => call("transfer_ownership", { p_group: gid, p_user: who }, `${name} is now the owner`));
+  if (act === "remove") return confirmSheet(`Remove ${name}?`, `${esc(name)} loses access to ${esc(g.name)}. Their wagers on bets that haven't settled are removed, and so are their props. They can rejoin with the invite code unless you make a new one.`, `Remove ${name}`, true,
+    () => call("remove_member", { p_group: gid, p_user: who }, `${name} removed`));
+  if (act === "delstat") return confirmSheet(`Delete ${t.dataset.stat}?`, `Removes the ${esc(t.dataset.stat)} prop for everyone. Bets already posted stay on the board.`, `Delete ${t.dataset.stat}`, true,
+    () => call("delete_prop_stat", { p_group: gid, p_stat: t.dataset.stat }, `${t.dataset.stat} deleted`));
+  if (act === "delprop") return inline("delete_prop", { p_prop: t.dataset.prop }, "Prop removed");
+  if (act === "reset") return confirmSheet("Reset all balances?", `Everyone goes back to ${fmtTok(g.starting_balance ?? 1000)} tokens. Past bets stay in history.`, "Reset balances", true,
+    () => call("reset_balances", { p_group: gid }, "New season. Everyone is reset."));
+  if (act === "delgroup") {
+    const typed = $("#set-del").value;
+    if (typed !== g.name) return toast("Type the group name exactly to confirm.");
+    return confirmSheet(`Delete ${g.name} for good?`, "Every bet, wager, prop and balance is gone for everyone. This can't be undone.", "Delete group", true, async () => {
+      const { error } = await sb.rpc("delete_group", { p_group: gid, p_confirm_name: typed });
+      if (error) return errMsg(error);
+      toast(`${g.name} deleted`); state.tab = "board"; store.set("hl-group", ""); await loadGroups(); return "";
+    });
+  }
+  if (act === "leave") return confirmSheet(`Leave ${g.name}?`, "Your wagers on bets that haven't settled are removed, and so are your props. You can rejoin with the invite code.", "Leave group", true, async () => {
+    const { error } = await sb.rpc("leave_group", { p_group: gid });
+    if (error) return errMsg(error);
+    toast(`You left ${g.name}`); state.tab = "board"; store.set("hl-group", ""); await loadGroups(); return "";
+  });
 }
 
 /* ---------------- events ---------------- */
@@ -849,6 +967,9 @@ document.addEventListener("click", async e => {
     try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
     return;
   }
+  if (t.id === "openSettings") { closeSheet(); state.tab = "settings"; window.scrollTo(0, 0); return render(); }
+  if (t.id === "settingsBack") { state.tab = "leaders"; return render(); }
+  if (t.dataset.set) return settingsAction(t);
   if (t.id === "newStat") return openNewStat();
   if (t.dataset.pfStat !== undefined) { state.propStat = t.dataset.pfStat; return render(); }
   if (t.dataset.pfPlayer !== undefined) { state.propPlayer = t.dataset.pfPlayer; return render(); }
