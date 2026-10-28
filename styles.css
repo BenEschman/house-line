@@ -139,3 +139,25 @@ nav.tabs button[aria-current="true"]{color:var(--felt)}
 .payout b{font-family:var(--display);font-size:22px;color:var(--felt)}
 .toast{position:fixed;left:50%;transform:translateX(-50%);bottom:calc(84px + env(safe-area-inset-bottom,0px));background:var(--ink);color:var(--bg);padding:10px 16px;border-radius:999px;font-weight:600;font-size:14px;z-index:30;box-shadow:var(--shadow);max-width:90vw;text-align:center}
 code{font-size:13px;background:var(--bg);padding:1px 5px;border-radius:5px}
+
+/* live odds */
+.out .opened{font-size:11px;color:var(--muted);text-decoration:line-through;text-decoration-color:var(--line)}
+.livebar{display:flex;flex-wrap:wrap;align-items:center;gap:0 2px;margin-top:6px;font-size:13px;color:var(--muted)}
+.livebar b{color:var(--ink)}
+.livebar .when{margin-left:auto;font-size:11px}
+.livebar .dot{width:8px;height:8px;border-radius:50%;background:var(--loss);margin-right:6px;animation:pulse 1.6s ease-in-out infinite}
+.livebar .dot.off{background:var(--muted);animation:none}
+.livebar .prog{flex-basis:100%;height:4px;border-radius:2px;background:var(--line);margin-top:6px;position:relative;overflow:hidden}
+.livebar .prog i{position:absolute;inset:0 auto 0 0;background:var(--felt);border-radius:2px}
+@keyframes pulse{50%{opacity:.35}}
+@media (prefers-reduced-motion:reduce){.livebar .dot{animation:none}}
+.btn.live-btn{color:var(--loss);border-color:var(--loss-soft)}
+.stepper{display:grid;grid-template-columns:48px 1fr 48px;gap:8px}
+.stepper button{border:1px solid var(--line);background:var(--bg);border-radius:10px;font-size:22px;font-weight:600}
+.stepper .inp{text-align:center;font-family:var(--display);font-size:24px;font-weight:700}
+input[type=range]{width:100%;accent-color:var(--felt)}
+.quote{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.quote div{background:var(--felt-soft);border-radius:10px;padding:10px 12px;display:flex;flex-direction:column;min-width:0}
+.quote small{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.quote b{font-family:var(--display);font-size:28px;color:var(--felt);line-height:1.1}
+.quote span{font-size:11px;color:var(--muted)}

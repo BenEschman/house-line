@@ -20,6 +20,38 @@ const fmtOdds = o => (o > 0 ? "+" : "") + o;
 const fmtTok = n => Math.round(Number(n) || 0).toLocaleString();
 const returns = (stake, odds) => stake + Math.floor(odds > 0 ? stake * odds / 100 : stake * 100 / Math.abs(odds));
 const validOdds = o => Number.isInteger(o) && Math.abs(o) >= 100;
+
+// Live pricing — mirrors private.* functions in supabase/schema.sql so the preview matches the server.
+const impliedProb = o => o < 0 ? -o / (-o + 100) : 100 / (o + 100);
+function toAmerican(q) {
+  q = Math.min(Math.max(q, 0.0099), 0.99);
+  if (q >= 0.5) return Math.min(-Math.round(100 * q / (1 - q) / 5) * 5, -100);
+  return Math.max(Math.round(100 * (1 - q) / q / 5) * 5, 100);
+}
+function poissonAtLeast(k, mu) {
+  if (k <= 0) return 1;
+  if (mu <= 0) return 0;
+  let term = Math.exp(-mu), cdf = 0;
+  for (let i = 0; i < k; i++) { cdf += term; term = term * mu / (i + 1); }
+  return Math.max(0, Math.min(1, 1 - cdf));
+}
+function calibrateLambda(k, p) {
+  let lo = 1e-6, hi = Math.max(10, k * 4 + 10);
+  for (let i = 0; i < 80; i++) { const mid = (lo + hi) / 2; poissonAtLeast(k, mid) < p ? lo = mid : hi = mid; }
+  return (lo + hi) / 2;
+}
+function liveQuote(b, current, progress) {
+  const [ov, un] = b.outcomes;
+  let lambda = b.live_lambda, over = b.live_overround;
+  if (lambda == null) {
+    const qo = impliedProb(ov.open_odds ?? ov.odds), qu = impliedProb(un.open_odds ?? un.odds);
+    lambda = calibrateLambda(Math.floor(Number(b.line)) + 1, Math.min(Math.max(qo / (qo + qu), 0.01), 0.99));
+    over = qo + qu;
+  }
+  const pOver = poissonAtLeast(Math.floor(Number(b.line) - current) + 1, lambda * (1 - progress));
+  return { over: toAmerican(pOver * over), under: toAmerican((1 - pOver) * over), decided: current > Number(b.line) || progress >= 1, pOver };
+}
+const agoText = iso => { const m = Math.round((Date.now() - new Date(iso)) / 60000); return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; };
 const uid = () => state.session?.user?.id;
 const group = () => state.groups.find(g => g.id === state.groupId);
 const store = { get: k => { try { return localStorage.getItem(k); } catch { return null; } },
@@ -53,7 +85,7 @@ async function openGroup(id) {
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
   const [bets, wagers, members] = await Promise.all([
-    sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
+    sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
   ]);
@@ -194,12 +226,14 @@ function betCard(b) {
     return `<button class="out ${cls}" data-bet="${esc(b.id)}" data-out="${esc(o.id)}" ${open ? "" : "disabled"}>
       <span class="lbl">${esc(o.label)}</span>
       <span class="odds num">${fmtOdds(o.odds)}</span>
+      ${o.open_odds != null && o.open_odds !== o.odds ? `<span class="opened num">opened ${fmtOdds(o.open_odds)}</span>` : ""}
       <span class="pool num">${fmtTok(pool[o.id] || 0)} wagered${cls === "won" ? " · winner" : ""}</span>
       ${mineBy[o.id] ? `<span class="mine num">You: ${fmtTok(mineBy[o.id])}</span>` : ""}
     </button>`;
   }).join("");
   const live = b.status === "open" || b.status === "locked";
   const ctl = live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
+      ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live update</button>` : ""}
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
       <button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button>
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
@@ -208,6 +242,8 @@ function betCard(b) {
       <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
+      ${b.live_updated_at ? `<div class="livebar"><span class="dot${live ? "" : " off"}"></span><b class="num">${esc(String(Number(b.live_current)))}</b>&nbsp;so far · <span class="num">${Math.round(Number(b.live_progress) * 100)}%</span>&nbsp;through<span class="when">${agoText(b.live_updated_at)}</span>
+        <div class="prog" aria-hidden="true"><i style="width:${Math.round(Number(b.live_progress) * 100)}%"></i></div></div>` : ""}
     </div>
     <div class="outs">${outs}</div>${ctl}
   </article>`;
@@ -304,11 +340,61 @@ function openWager(betId, outId) {
     const stake = Math.floor(Number(input.value) || 0);
     if (stake < 1) return ($("#s-err").textContent = "Enter at least 1 token.");
     $("#place").disabled = true;
-    const { error } = await sb.rpc("place_wager", { p_outcome: outId, p_stake: stake });
-    if (error) { $("#s-err").textContent = errMsg(error); $("#place").disabled = false; return; }
+    const { error } = await sb.rpc("place_wager", { p_outcome: outId, p_stake: stake, p_expected_odds: o.odds });
+    if (error) {
+      const msg = errMsg(error);
+      if (msg.startsWith("Odds moved")) { closeSheet(); toast(msg); return loadGroupData(); }
+      $("#s-err").textContent = msg; $("#place").disabled = false; return;
+    }
     closeSheet(); toast(`Bet ${fmtTok(stake)} on ${o.label}`); loadGroupData();
   };
   input.focus();
+}
+
+function openLive(betId) {
+  const b = betById(betId); if (!b) return;
+  const line = Number(b.line);
+  let cur = Number(b.live_current ?? 0), prog = Math.round(Number(b.live_progress ?? 0) * 100);
+  sheet(`<h4>Live update: ${esc(b.title)}</h4>
+    <div class="f">Count so far · line ${esc(b.line)}
+      <div class="stepper"><button type="button" id="l-minus" aria-label="Decrease count">−</button>
+        <input class="inp num" id="l-cur" inputmode="decimal" value="${cur}">
+        <button type="button" id="l-plus" aria-label="Increase count">+</button></div></div>
+    <label class="f" for="l-prog">How far through the event · <span class="num" id="l-prog-v">${prog}%</span>
+      <input type="range" id="l-prog" min="0" max="100" step="5" value="${prog}"></label>
+    <div class="quote">
+      <div><small>${esc(b.outcomes[0].label)}</small><b class="num" id="q-over"></b><span class="num" id="q-over-was"></span></div>
+      <div><small>${esc(b.outcomes[1].label)}</small><b class="num" id="q-under"></b><span class="num" id="q-under-was"></span></div>
+    </div>
+    <span class="hint" id="l-note"></span>
+    <div class="err" id="l-err"></div>
+    <button class="btn primary big" id="l-save">Update odds</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  const curEl = $("#l-cur"), progEl = $("#l-prog");
+  const read = () => ({ c: Math.max(0, Number(curEl.value) || 0), p: Number(progEl.value) / 100 });
+  const paint = () => {
+    const { c, p } = read();
+    $("#l-prog-v").textContent = Math.round(p * 100) + "%";
+    const q = liveQuote(b, c, p);
+    $("#q-over").textContent = fmtOdds(q.over); $("#q-under").textContent = fmtOdds(q.under);
+    $("#q-over-was").textContent = "now " + fmtOdds(b.outcomes[0].odds); $("#q-under-was").textContent = "now " + fmtOdds(b.outcomes[1].odds);
+    $("#l-note").textContent = c > line ? `Over has hit. Saving locks the bet so you can settle it.`
+      : p >= 1 ? `Event finished under the line. Saving locks the bet so you can settle it.`
+      : `Chance of going over: ${Math.round(q.pOver * 100)}%. Wagers already placed keep their odds.`;
+  };
+  $("#l-minus").onclick = () => { curEl.value = Math.max(0, (Number(curEl.value) || 0) - 1); paint(); };
+  $("#l-plus").onclick = () => { curEl.value = (Number(curEl.value) || 0) + 1; paint(); };
+  curEl.addEventListener("input", paint); progEl.addEventListener("input", paint);
+  paint();
+  $("#l-save").onclick = async () => {
+    const { c, p } = read();
+    $("#l-save").disabled = true;
+    const { data, error } = await sb.rpc("update_live_odds", { p_bet: betId, p_current: c, p_progress: p });
+    if (error) { $("#l-err").textContent = errMsg(error); $("#l-save").disabled = false; return; }
+    closeSheet();
+    toast(data?.status === "locked" && b.status === "open" ? "Odds updated. The bet is decided, so it's locked. Settle it when ready." : "Live odds updated");
+    loadGroupData();
+  };
 }
 
 function openSettle(betId) {
@@ -384,6 +470,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.rm) { syncDraft(); state.draft.outcomes.splice(+t.dataset.rm, 1); return render(); }
   if (t.dataset.out && !t.disabled) return openWager(t.dataset.bet, t.dataset.out);
   if (t.dataset.act === "settle") return openSettle(t.dataset.bet);
+  if (t.dataset.act === "live") return openLive(t.dataset.bet);
   if (t.dataset.act === "void") return openVoid(t.dataset.bet);
   if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
     const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });
