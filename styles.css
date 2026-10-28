@@ -185,3 +185,10 @@ input[type=datetime-local].inp{min-height:46px}
 .odds-field .sign:active{transform:scale(.96)}
 .odds-field .inp{min-width:0}
 .orow{grid-template-columns:1fr 132px 36px}
+
+/* alternate lines */
+.lineval{display:grid;place-items:center;border:1px solid var(--line);background:var(--bg);border-radius:10px;font-family:var(--display);font-size:28px;font-weight:700;min-height:48px}
+.stepper button:disabled{opacity:.35}
+.sheet .seg{margin-bottom:0}
+.sheet .seg button{flex:1}
+.alt-tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--chip);background:var(--chip-soft);padding:1px 6px;border-radius:999px;vertical-align:2px}

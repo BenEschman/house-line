@@ -743,3 +743,128 @@ returns void language sql security definer set search_path = public as $$
 $$;
 revoke execute on function private.lock_expired_bets() from public, anon, authenticated;
 select cron.schedule('house-line-lock-expired-bets', '* * * * *', 'select private.lock_expired_bets()');
+
+-------------------------------------------------------------------------------
+-- Alternate lines on over/under bets. Bettors pick their own line; odds come
+-- from the same Poisson model as live odds. O/U bets settle by final count,
+-- grading each wager on its own line (landing exactly on a line is a push).
+-------------------------------------------------------------------------------
+
+alter table public.wagers
+  add column line numeric,
+  add column side text check (side in ('over', 'under'));
+alter table public.bets add column final_value numeric;
+
+create or replace function private.ou_price(b public.bets, p_line numeric, p_side text)
+returns int language plpgsql stable security definer set search_path = public, private as $$
+declare
+  o_over outcomes; o_under outcomes;
+  lam double precision := b.live_lambda; ovr double precision := b.live_overround;
+  q_o double precision; q_u double precision; p_over double precision;
+begin
+  if lam is null then
+    select * into o_over  from outcomes where bet_id = b.id and position = 0;
+    select * into o_under from outcomes where bet_id = b.id and position = 1;
+    q_o := american_to_prob(coalesce(o_over.open_odds, o_over.odds));
+    q_u := american_to_prob(coalesce(o_under.open_odds, o_under.odds));
+    lam := calibrate_lambda(floor(b.line)::int + 1, least(greatest(q_o / (q_o + q_u), 0.01), 0.99));
+    ovr := q_o + q_u;
+  end if;
+  p_over := poisson_at_least(floor(p_line - coalesce(b.live_current, 0))::int + 1,
+                             lam * (1 - coalesce(b.live_progress, 0)));
+  return prob_to_american((case when p_side = 'over' then p_over else 1 - p_over end) * ovr);
+end $$;
+revoke execute on function private.ou_price(public.bets, numeric, text) from public, anon, authenticated;
+
+create or replace function public.place_alt_wager(
+  p_bet uuid, p_side text, p_line numeric, p_stake int, p_expected_odds int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare b bets; o outcomes; m memberships; w wagers; price int;
+begin
+  if p_side not in ('over', 'under') then raise exception 'Pick over or under'; end if;
+  select * into b from bets where id = p_bet for share;
+  if not found or hidden_from_me(p_bet) or not is_member(b.group_id) then raise exception 'Bet not found'; end if;
+  if b.line is null then raise exception 'Only over/under bets have alternate lines'; end if;
+  if b.creator_id = auth.uid() then raise exception 'You can''t bet on your own line'; end if;
+  if b.closes_at is not null and now() >= b.closes_at then raise exception 'Betting on this closed'; end if;
+  if b.status <> 'open' then raise exception 'This bet is closed to new wagers'; end if;
+  if p_line is null or p_line <> floor(p_line) + 0.5 then raise exception 'Lines must end in .5'; end if;
+  if p_line <= coalesce(b.live_current, 0) then raise exception 'The count has already passed that line'; end if;
+  if p_line > b.line * 4 + 20 then raise exception 'That line is too far from the main line'; end if;
+  if p_stake is null or p_stake < 1 then raise exception 'Stake must be at least 1 token'; end if;
+
+  price := ou_price(b, p_line, p_side);
+  if price is distinct from p_expected_odds then
+    raise exception 'Odds moved to %. Check the new price and try again.',
+      case when price > 0 then '+' || price else price::text end;
+  end if;
+
+  select * into m from memberships where group_id = b.group_id and user_id = auth.uid() for update;
+  if not found then raise exception 'You are not in this group'; end if;
+  if m.balance < p_stake then raise exception 'Not enough tokens: you have %', m.balance; end if;
+
+  select * into o from outcomes where bet_id = b.id and position = case when p_side = 'over' then 0 else 1 end;
+  update memberships set balance = balance - p_stake where group_id = b.group_id and user_id = auth.uid();
+  insert into wagers (group_id, bet_id, outcome_id, user_id, stake, odds, line, side)
+    values (b.group_id, b.id, o.id, auth.uid(), p_stake, price, p_line, p_side)
+    returning * into w;
+  return w;
+end $$;
+revoke execute on function public.place_alt_wager(uuid, text, numeric, int, int) from public, anon;
+grant execute on function public.place_alt_wager(uuid, text, numeric, int, int) to authenticated;
+
+create or replace function public.settle_ou(p_bet uuid, p_final numeric)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets; winner uuid;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then raise exception 'Only the bet''s creator or the group owner can settle it'; end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if b.line is null then raise exception 'Settle custom bets by picking the winning outcome'; end if;
+  if p_final is null or p_final < 0 then raise exception 'Enter the final count'; end if;
+
+  update wagers w set payout = case
+      when (coalesce(w.side, case when o.position = 0 then 'over' else 'under' end) = 'over'  and p_final > coalesce(w.line, b.line))
+        or (coalesce(w.side, case when o.position = 0 then 'over' else 'under' end) = 'under' and p_final < coalesce(w.line, b.line))
+        then american_return(w.stake, w.odds)
+      when p_final = coalesce(w.line, b.line) then w.stake
+      else 0 end
+    from outcomes o
+    where o.id = w.outcome_id and w.bet_id = p_bet;
+
+  update memberships m set balance = m.balance + s.total
+    from (select user_id, sum(payout) as total from wagers where bet_id = p_bet and payout > 0 group by user_id) s
+    where m.group_id = b.group_id and m.user_id = s.user_id;
+
+  select id into winner from outcomes where bet_id = p_bet
+    and position = case when p_final > b.line then 0 when p_final < b.line then 1 else -1 end;
+  update bets set status = 'settled', winning_outcome_id = winner, final_value = p_final, settled_at = now()
+    where id = p_bet;
+end $$;
+revoke execute on function public.settle_ou(uuid, numeric) from public, anon;
+grant execute on function public.settle_ou(uuid, numeric) to authenticated;
+
+create or replace function public.settle_bet(p_bet uuid, p_winner uuid)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then
+    raise exception 'Only the bet''s creator or the group owner can settle it';
+  end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if not exists (select 1 from outcomes where id = p_winner and bet_id = p_bet) then
+    raise exception 'That outcome is not part of this bet';
+  end if;
+  if exists (select 1 from wagers where bet_id = p_bet and line is not null) then
+    raise exception 'This bet has alternate-line wagers. Settle it with the final count on the website.';
+  end if;
+  update wagers set payout = case when outcome_id = p_winner then american_return(stake, odds) else 0 end
+    where bet_id = p_bet;
+  update memberships m set balance = m.balance + s.total
+    from (select user_id, sum(payout) as total from wagers where bet_id = p_bet and payout > 0 group by user_id) s
+    where m.group_id = b.group_id and m.user_id = s.user_id;
+  update bets set status = 'settled', winning_outcome_id = p_winner, settled_at = now() where id = p_bet;
+end $$;

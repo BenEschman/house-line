@@ -80,6 +80,22 @@ function closePicker(prefix, value) {
       `<button type="button" data-close-preset="${prefix}" data-v="${v}" aria-pressed="${value === v}">${l}</button>`).join("")}</div>
     <input class="inp num" type="datetime-local" id="${prefix}-at" value="${esc(value)}" aria-label="Closing date and time">`;
 }
+// Price one side of an O/U bet at any line, from the bet's live state (mirrors private.ou_price).
+function ouPrice(b, line, side) {
+  const [ov, un] = b.outcomes;
+  let lambda = b.live_lambda, over = b.live_overround;
+  if (lambda == null) {
+    const qo = impliedProb(ov.open_odds ?? ov.odds), qu = impliedProb(un.open_odds ?? un.odds);
+    lambda = calibrateLambda(Math.floor(Number(b.line)) + 1, Math.min(Math.max(qo / (qo + qu), 0.01), 0.99));
+    over = qo + qu;
+  }
+  const pOver = poissonAtLeast(Math.floor(line - Number(b.live_current ?? 0)) + 1, lambda * (1 - Number(b.live_progress ?? 0)));
+  return toAmerican((side === "over" ? pOver : 1 - pOver) * over);
+}
+// Step to the next/previous half-point line (alternate lines always end in .5).
+const lineUp = l => Math.floor(l) + 0.5 > l ? Math.floor(l) + 0.5 : Math.floor(l) + 1.5;
+const lineDown = l => Math.ceil(l) - 0.5 < l ? Math.ceil(l) - 0.5 : Math.ceil(l) - 1.5;
+const sideLabel = s => s === "over" ? "Over" : "Under";
 const agoText = iso => { const m = Math.round((Date.now() - new Date(iso)) / 60000); return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; };
 const uid = () => state.session?.user?.id;
 const group = () => state.groups.find(g => g.id === state.groupId);
@@ -158,7 +174,7 @@ function myStats() {
     if (w.user_id !== uid()) continue;
     const b = betById(w.bet_id);
     if (w.payout == null) risk += w.stake;
-    else if (b?.status === "settled") (w.payout > 0 ? won++ : lost++);
+    else if (b?.status === "settled") (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
   }
   return { bal: me()?.balance ?? 0, risk, won, lost };
 }
@@ -166,7 +182,7 @@ function recordOf(id) {
   let won = 0, lost = 0, risk = 0;
   for (const w of state.wagers) if (w.user_id === id) {
     if (w.payout == null) risk += w.stake;
-    else if (betById(w.bet_id)?.status === "settled") (w.payout > 0 ? won++ : lost++);
+    else if (betById(w.bet_id)?.status === "settled") (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
   }
   return { won, lost, risk };
 }
@@ -280,6 +296,8 @@ function betCard(b) {
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
       ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Betting closed at ${esc(fmtClose(b.closes_at))}` : `Betting closes ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
+      ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
+      ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
       ${mine && open ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
       ${b.live_updated_at ? `<div class="livebar"><span class="dot${live ? "" : " off"}"></span><b class="num">${esc(String(Number(b.live_current)))}</b>&nbsp;so far · <span class="num">${Math.round(Number(b.live_progress) * 100)}%</span>&nbsp;through<span class="when">${agoText(b.live_updated_at)}</span>
@@ -361,9 +379,10 @@ function slipHTML() {
     let right, status;
     if (w.payout == null) { status = "pending"; right = `<span>to win ${fmtTok(returns(w.stake, w.odds) - w.stake)}</span>`; }
     else if (b?.status === "void") { status = "voided"; right = `<span>refunded</span>`; }
+    else if (w.payout === w.stake) { status = "push"; right = `<span>refunded</span>`; }
     else if (w.payout > 0) { status = "won"; right = `<span class="pos">+${fmtTok(w.payout - w.stake)}</span>`; }
     else { status = "lost"; right = `<span class="neg">−${fmtTok(w.stake)}</span>`; }
-    return `<div class="row"><div class="main"><div class="t">${esc(o?.label || "Outcome")} <span class="num" style="color:var(--felt)">${fmtOdds(w.odds)}</span></div>
+    return `<div class="row"><div class="main"><div class="t">${esc(w.line != null ? `${sideLabel(w.side)} ${Number(w.line)}` : o?.label || "Outcome")}${w.line != null ? ` <span class="alt-tag">alt line</span>` : ""} <span class="num" style="color:var(--felt)">${fmtOdds(w.odds)}</span></div>
       <div class="s">${esc(b?.title || "Bet")} · ${fmtTok(w.stake)} staked · ${status}</div></div><div class="amt num">${right}</div></div>`;
   }).join("")}</div>`;
 }
@@ -393,29 +412,68 @@ function openWager(betId, outId) {
   const b = betById(betId); const o = b?.outcomes.find(x => x.id === outId);
   if (!b || !o) return;
   const bal = myStats().bal;
+  const ou = b.line != null && b.outcomes.length === 2;
+  const main = Number(b.line);
+  const minLine = Number(b.live_current ?? 0);          // a line must sit above the count so far
+  const maxLine = main * 4 + 20;
+  let side = o.position === 0 ? "over" : "under", line = main;
+  const outcomeFor = sd => b.outcomes[sd === "over" ? 0 : 1];
+  const price = () => !ou ? o.odds : line === main ? outcomeFor(side).odds : ouPrice(b, line, side);
+  const label = () => !ou ? o.label : line === main ? outcomeFor(side).label : `${sideLabel(side)} ${line}`;
+
   sheet(`<h4>${esc(b.title)}</h4>
-    <div class="pick"><b>${esc(o.label)}</b><span class="odds num">${fmtOdds(o.odds)}</span></div>
+    ${ou ? `<div class="seg" role="group" aria-label="Side"><button type="button" data-side="over">Over</button><button type="button" data-side="under">Under</button></div>
+      <div class="f">Your line
+        <div class="stepper"><button type="button" id="w-down" aria-label="Lower line">−</button><div class="lineval num" id="w-line"></div><button type="button" id="w-up" aria-label="Raise line">+</button></div>
+        <button type="button" class="btn link" id="w-main" hidden>Back to the main line (${esc(b.line)})</button>
+      </div>` : ""}
+    <div class="pick"><b id="w-label"></b><span class="odds num" id="w-odds"></span></div>
     <label class="f" for="stake">Stake · ${fmtTok(bal)} available<input class="inp num" id="stake" inputmode="numeric" placeholder="0" autocomplete="off"></label>
     <div class="chips">${[10, 50, 100, 250].map(v => `<button data-chip="${v}">${v}</button>`).join("")}<button data-chip="${Math.floor(bal)}">All in</button></div>
     <div class="payout"><span>Returns</span><b class="num" id="ret">0</b></div>
     <div class="err" id="s-err"></div>
     <button class="btn primary big" id="place">Place wager</button>
     <button class="btn big" data-close>Cancel</button>`);
+
   const input = $("#stake");
-  const upd = () => { const v = Math.floor(Number(input.value) || 0); $("#ret").textContent = fmtTok(v > 0 ? returns(v, o.odds) : 0); };
-  input.addEventListener("input", upd);
-  document.querySelectorAll("[data-chip]").forEach(c => c.onclick = () => { input.value = c.dataset.chip; upd(); });
+  const paint = () => {
+    const odds = price();
+    $("#w-label").textContent = label();
+    $("#w-odds").textContent = fmtOdds(odds);
+    const v = Math.floor(Number(input.value) || 0);
+    $("#ret").textContent = fmtTok(v > 0 ? returns(v, odds) : 0);
+    if (ou) {
+      $("#w-line").textContent = line;
+      $("#w-main").hidden = line === main;
+      $("#w-down").disabled = lineDown(line) <= minLine;
+      $("#w-up").disabled = lineUp(line) > maxLine;
+      document.querySelectorAll("[data-side]").forEach(x => x.setAttribute("aria-pressed", String(x.dataset.side === side)));
+    }
+  };
+  if (ou) {
+    document.querySelectorAll("[data-side]").forEach(x => x.onclick = () => { side = x.dataset.side; paint(); });
+    $("#w-down").onclick = () => { line = lineDown(line); paint(); };
+    $("#w-up").onclick = () => { line = lineUp(line); paint(); };
+    $("#w-main").onclick = () => { line = main; paint(); };
+  }
+  input.addEventListener("input", paint);
+  document.querySelectorAll("[data-chip]").forEach(c => c.onclick = () => { input.value = c.dataset.chip; paint(); });
+  paint();
+
   $("#place").onclick = async () => {
     const stake = Math.floor(Number(input.value) || 0);
     if (stake < 1) return ($("#s-err").textContent = "Enter at least 1 token.");
+    const odds = price(), what = label();
     $("#place").disabled = true;
-    const { error } = await sb.rpc("place_wager", { p_outcome: outId, p_stake: stake, p_expected_odds: o.odds });
+    const { error } = !ou || line === main
+      ? await sb.rpc("place_wager", { p_outcome: (ou ? outcomeFor(side) : o).id, p_stake: stake, p_expected_odds: odds })
+      : await sb.rpc("place_alt_wager", { p_bet: b.id, p_side: side, p_line: line, p_stake: stake, p_expected_odds: odds });
     if (error) {
       const msg = errMsg(error);
       if (msg.startsWith("Odds moved")) { closeSheet(); toast(msg); return loadGroupData(); }
       $("#s-err").textContent = msg; $("#place").disabled = false; return;
     }
-    closeSheet(); toast(`Bet ${fmtTok(stake)} on ${o.label}`); loadGroupData();
+    closeSheet(); toast(`Bet ${fmtTok(stake)} on ${what} at ${fmtOdds(odds)}`); loadGroupData();
   };
   input.focus();
 }
@@ -495,6 +553,7 @@ function openCloseTime(betId) {
 
 function openSettle(betId) {
   const b = betById(betId); if (!b) return;
+  if (b.line != null) return openSettleCount(b);
   sheet(`<h4>Settle: ${esc(b.title)}</h4><b>Which outcome hit?</b>
     <div class="list" style="gap:8px">${b.outcomes.map(o => `<button class="btn big" data-win="${esc(o.id)}">${esc(o.label)}</button>`).join("")}</div>
     <div class="err" id="st-err"></div>
@@ -505,6 +564,36 @@ function openSettle(betId) {
     if (error) { $("#st-err").textContent = errMsg(error); btn.disabled = false; return; }
     closeSheet(); toast("Settled. Winners are paid."); loadGroupData();
   });
+}
+
+function openSettleCount(b) {
+  const line = Number(b.line);
+  const alts = state.wagers.filter(w => w.bet_id === b.id && w.line != null).length;
+  sheet(`<h4>Settle: ${esc(b.title)}</h4><b>What was the final count?</b>
+    <div class="stepper"><button type="button" id="f-minus" aria-label="Decrease">−</button>
+      <input class="inp num" id="f-val" inputmode="decimal" value="${esc(String(Number(b.live_current ?? 0)))}">
+      <button type="button" id="f-plus" aria-label="Increase">+</button></div>
+    <span class="hint" id="f-note"></span>
+    <div class="err" id="f-err"></div>
+    <button class="btn primary big" id="f-save">Settle at this count</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  const el = $("#f-val");
+  const paint = () => {
+    const v = Number(el.value);
+    const main = !Number.isFinite(v) ? "" : v > line ? `Over ${line} wins.` : v < line ? `Under ${line} wins.` : `Exactly ${line}: main-line bets push and get refunded.`;
+    $("#f-note").textContent = `${main}${alts ? ` ${alts} alternate-line ${alts === 1 ? "wager is" : "wagers are"} graded on ${alts === 1 ? "its" : "their"} own line.` : ""}`;
+  };
+  $("#f-minus").onclick = () => { el.value = Math.max(0, (Number(el.value) || 0) - 1); paint(); };
+  $("#f-plus").onclick = () => { el.value = (Number(el.value) || 0) + 1; paint(); };
+  el.addEventListener("input", paint); paint();
+  $("#f-save").onclick = async () => {
+    const v = Number(el.value);
+    if (el.value.trim() === "" || !Number.isFinite(v) || v < 0) return ($("#f-err").textContent = "Enter the final count.");
+    $("#f-save").disabled = true;
+    const { error } = await sb.rpc("settle_ou", { p_bet: b.id, p_final: v });
+    if (error) { $("#f-err").textContent = errMsg(error); $("#f-save").disabled = false; return; }
+    closeSheet(); toast(`Settled at ${v}. Winners are paid.`); loadGroupData();
+  };
 }
 
 function openVoid(betId) {
