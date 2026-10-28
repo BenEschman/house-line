@@ -163,7 +163,7 @@ async function loadGroupData() {
   const [bets, wagers, members, hidden, props] = await Promise.all([
     sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
-    sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
+    sb.from("memberships").select("user_id, balance, profiles(username, avatar)").eq("group_id", gid),
     sb.from("bet_hidden").select("bet_id, user_id").eq("group_id", gid),
     sb.from("props").select("*").eq("group_id", gid).order("created_at"),
   ]);
@@ -172,7 +172,7 @@ async function loadGroupData() {
   if (err) toast(errMsg(err));
   state.bets = (bets.data || []).map(b => ({ ...b, outcomes: (b.outcomes || []).sort((x, y) => x.position - y.position) }));
   state.wagers = wagers.data || [];
-  state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player" }));
+  state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player", avatar: m.profiles?.avatar || null }));
   state.props = props.data || [];
   state.hidden = {};
   for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
@@ -186,8 +186,8 @@ function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(
 function subscribe(gid) {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel("group-" + gid);
-  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props"])
-    ch.on("postgres_changes", { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
+  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props", "profiles"])
+    ch.on("postgres_changes", table === "profiles" ? { event: "*", schema: "public", table } : { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
   ch.subscribe();
   state.channel = ch;
 }
@@ -197,6 +197,14 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && st
 /* ---------------- derived ---------------- */
 
 const me = () => state.members.find(m => m.id === uid());
+const userOf = id => state.members.find(m => m.id === id);
+const usernameOf = id => userOf(id)?.username || "player";
+// Profile photo, or a colored initial when there isn't one. size in px.
+function avatarHTML(id, size = 34) {
+  const u = userOf(id), name = u?.username || "?";
+  if (u?.avatar) return `<img class="av" src="${esc(u.avatar)}" alt="" width="${size}" height="${size}" style="width:${size}px;height:${size}px">`;
+  return `<span class="av initial" style="width:${size}px;height:${size}px;font-size:${Math.round(size * 0.42)}px">${esc((name[0] || "?").toUpperCase())}</span>`;
+}
 const nameOf = id => id === uid() ? "You" : (state.members.find(m => m.id === id)?.username || "player");
 const betById = id => state.bets.find(b => b.id === id);
 const propOf = b => b.prop_id ? state.props.find(p => p.id === b.prop_id) : null;
@@ -233,8 +241,9 @@ function render() {
   if (!state.groupId) { app.innerHTML = noGroupHTML(); return; }
   $("#groupName").textContent = group()?.name || "";
   $("#bal").textContent = state.loaded ? fmtTok(myStats().bal) : "—";
+  $("#meAvatar").innerHTML = avatarHTML(uid(), 34);
   document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === state.tab)));
-  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML, settings: settingsHTML }[state.tab]();
+  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML, settings: settingsHTML, profile: profileHTML }[state.tab]();
 }
 
 function setupHTML() {
@@ -327,8 +336,8 @@ function betCard(b) {
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
   return `<article class="bet" data-bet-card="${esc(b.id)}">
     <div class="bet-head">
-      <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
-      <h3>${esc(b.title)}</h3>
+      <div class="bet-meta">${avatarHTML(b.creator_id, 18)}<span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
+      <h3>${esc(prop ? `${usernameOf(prop.player_id)} · ${prop.stat}` : b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
       ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Ended ${esc(fmtClose(b.closes_at))} · waiting for ${esc(b.creator_id === uid() ? "you" : nameOf(b.creator_id))} to settle` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
       ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
@@ -463,7 +472,7 @@ function propRow(pr) {
     ? `<button class="prop-live" data-goto-bet="${esc(active.id)}"><span class="num">${esc(String(Number(active.line)))}</span><span class="go">›</span></button>`
     : n >= AUTO_THRESHOLD ? `<span class="alt-tag">auto</span>` : `<span class="prop-status num">${n}/${AUTO_THRESHOLD}</span>`;
   return `<div class="stat-row">
-    <span class="initial">${esc((nameOf(pr.player_id)[0] || "?").toUpperCase())}</span>
+    ${avatarHTML(pr.player_id, 30)}
     <div class="who"><b>${esc(pr.player_id === uid() ? "You" : nameOf(pr.player_id))}</b>${recent ? `<div class="results">${recent}</div>` : `<span class="prop-status">No results yet</span>`}</div>
     ${right}
   </div>`;
@@ -596,7 +605,7 @@ function leadersHTML() {
     <button class="btn" id="copyCode">Copy</button></div>` : "");
   return `<h2>Leaderboard</h2>${invite}<div class="list">${rows.map((r, i) => {
     const rec = recordOf(r.id);
-    return `<div class="row"><div class="rank num">${i + 1}</div><div class="initial">${esc((r.username[0] || "?").toUpperCase())}</div>
+    return `<div class="row"><div class="rank num">${i + 1}</div>${avatarHTML(r.id, 34)}
       <div class="main"><div class="t">${esc(r.id === uid() ? r.username + " (you)" : r.username)}</div><div class="s num">${rec.won}–${rec.lost} · ${fmtTok(rec.risk)} at risk</div></div>
       <div class="amt num">${fmtTok(r.balance)}</div></div>`;
   }).join("")}</div>`;
@@ -936,6 +945,109 @@ async function settingsAction(t) {
   });
 }
 
+/* ---------------- profile ---------------- */
+
+function profileHTML() {
+  const me = userOf(uid()) || { username: "", balance: 0 };
+  const mine = state.wagers.filter(w => w.user_id === uid());
+  const settled = mine.filter(w => w.payout != null && betById(w.bet_id)?.status === "settled");
+  const won = settled.filter(w => w.payout > w.stake), lost = settled.filter(w => w.payout === 0);
+  const profit = settled.reduce((a, w) => a + (w.payout - w.stake), 0);
+  const best = won.reduce((m, w) => Math.max(m, w.payout - w.stake), 0);
+  const staked = mine.reduce((a, w) => a + w.stake, 0);
+  const posted = state.bets.filter(b => b.creator_id === uid()).length;
+  const hit = won.length + lost.length ? Math.round(won.length / (won.length + lost.length) * 100) : null;
+  const rank = [...state.members].sort((a, b) => b.balance - a.balance).findIndex(m => m.id === uid()) + 1;
+  return `<button class="btn link back" id="profileBack">‹ Back</button>
+  <section class="pf-hero">
+    <div class="pf-photo">${avatarHTML(uid(), 96)}</div>
+    <div class="pf-photo-acts">
+      <button class="btn" id="pfPhoto">${me.avatar ? "Change photo" : "Add photo"}</button>
+      ${me.avatar ? `<button class="btn link danger-link" id="pfRemove">Remove</button>` : ""}
+      <input type="file" id="pf-file" accept="image/*" hidden>
+    </div>
+  </section>
+  <section class="set-block">
+    <label class="f" for="pf-name">Username<div class="inline"><input class="inp" id="pf-name" maxlength="20" autocapitalize="none" autocomplete="username" value="${esc(me.username)}"><button class="btn" id="pfSaveName">Save</button></div>
+      <span class="hint">2 to 20 letters, numbers, or underscores. Your prop lines update to the new name.</span></label>
+    <div class="f">Email<span class="pf-email">${esc(state.session?.user?.email || "")}</span></div>
+  </section>
+  <section class="set-block"><h3>${esc(group()?.name || "This group")}</h3>
+    <div class="pf-stats">
+      <div><small>Balance</small><b class="num">${fmtTok(me.balance)}</b></div>
+      <div><small>Rank</small><b class="num">${rank ? `${rank} of ${state.members.length}` : "—"}</b></div>
+      <div><small>Profit</small><b class="num ${profit > 0 ? "pos" : profit < 0 ? "neg" : ""}">${profit > 0 ? "+" : profit < 0 ? "−" : ""}${fmtTok(Math.abs(profit))}</b></div>
+      <div><small>Record</small><b class="num">${won.length}–${lost.length}</b></div>
+      <div><small>Hit rate</small><b class="num">${hit == null ? "—" : hit + "%"}</b></div>
+      <div><small>Best win</small><b class="num">${best ? "+" + fmtTok(best) : "—"}</b></div>
+      <div><small>Total wagered</small><b class="num">${fmtTok(staked)}</b></div>
+      <div><small>Lines posted</small><b class="num">${posted}</b></div>
+    </div>
+  </section>
+  <section class="set-block"><h3>Account</h3>
+    <button class="btn big" id="pfPassword">Change password</button>
+    <button class="btn big" id="openSettings">${group()?.owner_id === uid() ? "Group settings" : "Group options"}</button>
+    <button class="btn big danger-outline" id="signOut">Sign out</button>
+  </section>`;
+}
+
+async function saveProfile(args, ok) {
+  const { error } = await sb.rpc("update_profile", args);
+  if (error) {
+    const m = errMsg(error);
+    return toast(/duplicate key|unique/i.test(m) ? "That username is taken" : m);
+  }
+  toast(ok); await loadGroupData();
+}
+
+// Center-crop to a square and shrink to 256px so photos stay small and load fast.
+function resizePhoto(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const side = Math.min(img.naturalWidth, img.naturalHeight), out = 256;
+      const c = document.createElement("canvas"); c.width = c.height = out;
+      const ctx = c.getContext("2d");
+      ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, out, out);
+      ctx.drawImage(img, (img.naturalWidth - side) / 2, (img.naturalHeight - side) / 2, side, side, 0, 0, out, out);
+      URL.revokeObjectURL(url);
+      let q = 0.85, data = c.toDataURL("image/jpeg", q);
+      while (data.length > 150000 && q > 0.4) { q -= 0.1; data = c.toDataURL("image/jpeg", q); }
+      resolve(data);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("That file isn't a photo we can read. Try a JPG or PNG.")); };
+    img.src = url;
+  });
+}
+
+document.addEventListener("change", async e => {
+  if (e.target.id !== "pf-file" || !e.target.files?.[0]) return;
+  try {
+    toast("Uploading photo…");
+    const data = await resizePhoto(e.target.files[0]);
+    await saveProfile({ p_avatar: data }, "Photo updated");
+  } catch (err) { toast(err.message); }
+  e.target.value = "";
+});
+
+function openPassword() {
+  sheet(`<h4>Change password</h4>
+    <label class="f" for="pw-new">New password<input class="inp" id="pw-new" type="password" autocomplete="new-password" minlength="6"></label>
+    <label class="f" for="pw-again">Type it again<input class="inp" id="pw-again" type="password" autocomplete="new-password" minlength="6"></label>
+    <div class="err" id="pw-err"></div>
+    <button class="btn primary big" id="pw-save">Change password</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  $("#pw-save").onclick = async () => {
+    const a = $("#pw-new").value, b = $("#pw-again").value;
+    if (a.length < 6) return ($("#pw-err").textContent = "Use at least 6 characters.");
+    if (a !== b) return ($("#pw-err").textContent = "Those don't match.");
+    $("#pw-save").disabled = true;
+    const { error } = await sb.auth.updateUser({ password: a });
+    if (error) { $("#pw-err").textContent = errMsg(error); $("#pw-save").disabled = false; return; }
+    closeSheet(); toast("Password changed");
+  };
+}
+
 /* ---------------- events ---------------- */
 
 function syncDraft() {
@@ -956,6 +1068,7 @@ $("#tabs").addEventListener("click", e => {
   state.tab = b.dataset.tab; window.scrollTo(0, 0); render();
 });
 $("#groupBtn").addEventListener("click", openGroups);
+$("#meBtn").addEventListener("click", () => { if (state.tab !== "profile") state.prevTab = state.tab; state.tab = "profile"; window.scrollTo(0, 0); render(); });
 $("#app").addEventListener("input", e => { if (state.tab === "create" && e.target.closest("#createForm")) syncDraft(); });
 
 document.addEventListener("click", async e => {
@@ -969,6 +1082,11 @@ document.addEventListener("click", async e => {
   }
   if (t.id === "openSettings") { closeSheet(); state.tab = "settings"; window.scrollTo(0, 0); return render(); }
   if (t.id === "settingsBack") { state.tab = "leaders"; return render(); }
+  if (t.id === "profileBack") { state.tab = state.prevTab || "board"; return render(); }
+  if (t.id === "pfPhoto") return $("#pf-file").click();
+  if (t.id === "pfRemove") return saveProfile({ p_clear_avatar: true }, "Photo removed");
+  if (t.id === "pfSaveName") return saveProfile({ p_username: $("#pf-name").value }, "Username saved");
+  if (t.id === "pfPassword") return openPassword();
   if (t.dataset.set) return settingsAction(t);
   if (t.id === "newStat") return openNewStat();
   if (t.dataset.pfStat !== undefined) { state.propStat = t.dataset.pfStat; return render(); }

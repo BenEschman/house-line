@@ -277,3 +277,25 @@ nav.tabs button{font-size:10.5px}
 .danger-zone h3{color:var(--loss)}
 .btn.danger.big{background:var(--loss);border-color:var(--loss);color:#fff}
 .sheet-body{margin:0;color:var(--ink);line-height:1.5}
+
+/* header: tokens then profile photo on the right */
+.top-right{display:flex;align-items:center;gap:8px;flex:none}
+.me-btn{border:0;background:none;padding:0;border-radius:50%;line-height:0}
+.me-btn .av{box-shadow:0 0 0 2px var(--paper),0 0 0 3px var(--line)}
+.av{border-radius:50%;object-fit:cover;flex:none;display:inline-block;vertical-align:middle}
+.av.initial{display:inline-grid;place-items:center;font-weight:700;background:var(--felt-soft);color:var(--felt)}
+.bet-meta .av{margin-right:-2px}
+.group-name{max-width:34vw}
+
+/* profile page */
+.pf-hero{display:flex;flex-direction:column;align-items:center;gap:10px;margin:4px 0 16px}
+.pf-photo .av{box-shadow:0 0 0 3px var(--paper),0 0 0 4px var(--line)}
+.pf-photo-acts{display:flex;align-items:center;gap:10px}
+.danger-link{color:var(--loss)}
+.pf-email{font-size:15px;color:var(--ink);text-transform:none;letter-spacing:0;font-weight:400;overflow-wrap:anywhere}
+.pf-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:8px}
+.pf-stats div{background:var(--bg);border-radius:10px;padding:10px 12px;min-width:0}
+.pf-stats small{display:block;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.pf-stats b{font-family:var(--display);font-size:24px;font-weight:700}
+.btn.danger-outline{color:var(--loss);border-color:var(--loss-soft)}
+@media (max-width:360px){.wallet small{display:none}}

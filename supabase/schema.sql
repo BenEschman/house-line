@@ -1569,3 +1569,35 @@ begin
 end $$;
 
 notify pgrst, 'reload schema';
+
+-------------------------------------------------------------------------------
+-- Profile page: photos (small data URLs resized in the browser) and username changes.
+-------------------------------------------------------------------------------
+
+alter table public.profiles
+  add column avatar text check (avatar is null or (avatar like 'data:image/%' and char_length(avatar) <= 200000));
+
+create or replace function public.update_profile(p_username text default null, p_avatar text default null, p_clear_avatar boolean default false)
+returns public.profiles language plpgsql security definer set search_path = public as $$
+declare pr profiles; u text;
+begin
+  if auth.uid() is null then raise exception 'Sign in first'; end if;
+  if p_username is not null then
+    u := lower(trim(p_username));
+    if u !~ '^[a-z0-9_]{2,20}$' then raise exception 'Usernames are 2 to 20 letters, numbers, or underscores'; end if;
+    if exists (select 1 from profiles where username = u and id <> auth.uid()) then raise exception 'That username is taken'; end if;
+    update profiles set username = u where id = auth.uid();
+  end if;
+  if p_clear_avatar then
+    update profiles set avatar = null where id = auth.uid();
+  elsif p_avatar is not null then
+    if p_avatar not like 'data:image/%' or char_length(p_avatar) > 200000 then raise exception 'That photo is too big. Try a different one.'; end if;
+    update profiles set avatar = p_avatar where id = auth.uid();
+  end if;
+  select * into pr from profiles where id = auth.uid();
+  return pr;
+end $$;
+revoke execute on function public.update_profile(text, text, boolean) from public, anon;
+grant execute on function public.update_profile(text, text, boolean) to authenticated;
+
+alter publication supabase_realtime add table public.profiles;
