@@ -1307,3 +1307,111 @@ end $$;
 revoke execute on function private.do_wager(uuid, uuid, text, numeric, int, int) from public, anon, authenticated;
 
 alter publication supabase_realtime add table public.props;
+
+-------------------------------------------------------------------------------
+-- Stats for every player: creating a stat gives each member a prop; new members
+-- get every stat; a whole slate of lines can be posted at once. Auto lines can
+-- be posted by anyone, including the player.
+-------------------------------------------------------------------------------
+
+create or replace function public.create_prop_stat(p_group uuid, p_stat text)
+returns int language plpgsql security definer set search_path = public, private as $$
+declare n int;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  if coalesce(trim(p_stat), '') = '' then raise exception 'Name the stat, like Drinks or Shots'; end if;
+  insert into props (group_id, player_id, stat, created_by)
+    select p_group, m.user_id,
+           coalesce((select stat from props where group_id = p_group and lower(stat) = lower(trim(p_stat)) limit 1), trim(p_stat)),
+           auth.uid()
+    from memberships m where m.group_id = p_group
+    on conflict (group_id, player_id, stat) do nothing;
+  get diagnostics n = row_count;
+  return n;
+end $$;
+revoke execute on function public.create_prop_stat(uuid, text) from public, anon;
+grant execute on function public.create_prop_stat(uuid, text) to authenticated;
+
+create or replace function private.add_props_for_new_member()
+returns trigger language plpgsql security definer set search_path = public as $$
+begin
+  insert into props (group_id, player_id, stat, created_by)
+    select distinct on (lower(stat)) new.group_id, new.user_id, stat, new.user_id
+    from props where group_id = new.group_id
+    order by lower(stat), created_at
+    on conflict (group_id, player_id, stat) do nothing;
+  return new;
+end $$;
+revoke execute on function private.add_props_for_new_member() from public, anon, authenticated;
+create trigger memberships_add_props after insert on public.memberships
+  for each row execute function private.add_props_for_new_member();
+
+create or replace function public.create_prop_bet(
+  p_prop uuid, p_line numeric, p_over_odds int, p_under_odds int,
+  p_closes_at timestamptz default null, p_starts_at timestamptz default null, p_hidden uuid[] default '{}')
+returns uuid language plpgsql security definer set search_path = public, private as $$
+declare pr props; s jsonb; uname text; line numeric; ov int; un int; b uuid; auto boolean;
+begin
+  select * into pr from props where id = p_prop;
+  if not found or not is_member(pr.group_id) then raise exception 'Prop not found'; end if;
+  if exists (select 1 from bets where prop_id = p_prop and status in ('open', 'locked')) then
+    raise exception 'This prop already has a line up. Settle or void it first.';
+  end if;
+  s := prop_suggestion(p_prop);
+  auto := (s ->> 'auto')::boolean;
+  if not auto and pr.player_id = auth.uid() then
+    raise exception 'Someone else has to set your line until it''s set automatically';
+  end if;
+  if auto then
+    line := (s ->> 'line')::numeric; ov := (s ->> 'over_odds')::int; un := (s ->> 'under_odds')::int;
+  else
+    if p_line is null or p_line < 0 then raise exception 'Set a line, like 3.5'; end if;
+    if p_over_odds is null or p_under_odds is null or abs(p_over_odds) < 100 or abs(p_under_odds) < 100 then
+      raise exception 'Odds need at least 100 (like -110 or +120)';
+    end if;
+    line := p_line; ov := p_over_odds; un := p_under_odds;
+  end if;
+  select username into uname from profiles where id = pr.player_id;
+  b := create_bet(pr.group_id, uname || ' · ' || pr.stat, '', line,
+         jsonb_build_array(jsonb_build_object('label', 'Over ' || line, 'odds', ov),
+                           jsonb_build_object('label', 'Under ' || line, 'odds', un)),
+         array(select h from unnest(coalesce(p_hidden, '{}')) h where h <> auth.uid()), p_closes_at, p_starts_at);
+  update bets set prop_id = p_prop, auto_line = auto where id = b;
+  return b;
+end $$;
+
+create or replace function public.prop_slate(p_group uuid, p_stat text)
+returns jsonb language plpgsql stable security definer set search_path = public, private as $$
+declare r record; out jsonb := '[]'::jsonb; active uuid;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  for r in
+    select pr.id, pr.player_id, p.username from props pr join profiles p on p.id = pr.player_id
+    where pr.group_id = p_group and lower(pr.stat) = lower(trim(p_stat))
+    order by lower(p.username)
+  loop
+    select id into active from bets where prop_id = r.id and status in ('open', 'locked') limit 1;
+    out := out || jsonb_build_array(jsonb_build_object(
+      'prop_id', r.id, 'player_id', r.player_id, 'username', r.username,
+      'active_bet', active, 'suggestion', prop_suggestion(r.id)));
+  end loop;
+  return out;
+end $$;
+revoke execute on function public.prop_slate(uuid, text) from public, anon;
+grant execute on function public.prop_slate(uuid, text) to authenticated;
+
+create or replace function public.create_prop_slate(
+  p_lines jsonb, p_closes_at timestamptz default null, p_starts_at timestamptz default null, p_hidden uuid[] default '{}')
+returns int language plpgsql security definer set search_path = public, private as $$
+declare e jsonb; n int := 0;
+begin
+  if jsonb_array_length(coalesce(p_lines, '[]'::jsonb)) = 0 then raise exception 'Pick at least one player'; end if;
+  for e in select * from jsonb_array_elements(p_lines) loop
+    perform create_prop_bet((e ->> 'prop_id')::uuid, (e ->> 'line')::numeric, (e ->> 'over')::int, (e ->> 'under')::int,
+                            p_closes_at, p_starts_at, p_hidden);
+    n := n + 1;
+  end loop;
+  return n;
+end $$;
+revoke execute on function public.create_prop_slate(jsonb, timestamptz, timestamptz, uuid[]) from public, anon;
+grant execute on function public.create_prop_slate(jsonb, timestamptz, timestamptz, uuid[]) to authenticated;

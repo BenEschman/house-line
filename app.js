@@ -419,70 +419,60 @@ function propHistory(pr) {
     .sort((a, b) => (b.settled_at || "").localeCompare(a.settled_at || ""));
 }
 const propActive = pr => state.bets.find(b => b.prop_id === pr.id && (b.status === "open" || b.status === "locked"));
+function statGroups() {
+  const by = {};
+  for (const pr of state.props) (by[pr.stat.toLowerCase()] ||= { stat: pr.stat, props: [] }).props.push(pr);
+  return Object.values(by).sort((a, b) => a.stat.localeCompare(b.stat));
+}
 
 function propsHTML() {
-  const byPlayer = {};
-  for (const pr of state.props) (byPlayer[pr.player_id] ||= []).push(pr);
-  const players = Object.keys(byPlayer).sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
-  const head = `<div class="props-head"><h2>Player props</h2><button class="btn primary" id="newProp">New prop</button></div>`;
+  const head = `<div class="props-head"><h2>Player props</h2><button class="btn primary" id="newStat">+ New stat line</button></div>`;
   if (!state.loaded) return head + `<div class="empty"><b>Loading…</b></div>`;
-  if (!players.length) return head + `<div class="empty"><b>No props yet</b>Make one for anyone in the group, like “Jake · Drinks”. Set the first ${AUTO_THRESHOLD} lines yourself. After that, the app sets the line from past results.</div>`;
-  return head + players.map(pid => `
-    <section class="player">
-      <h3 class="player-name"><span class="initial">${esc((nameOf(pid)[0] || "?").toUpperCase())}</span>${esc(pid === uid() ? "You" : nameOf(pid))}</h3>
-      <div class="list">${byPlayer[pid].map(propCard).join("")}</div>
-    </section>`).join("");
+  const stats = statGroups();
+  if (!stats.length) return head + `<div class="empty"><b>No stat lines yet</b>Add one, like Drinks or Shots, and everyone in the group gets a line for it. Set the first ${AUTO_THRESHOLD} lines yourself. After that, each player's line sets itself from their results.</div>`;
+  return head + stats.map(sg => {
+    const rows = [...sg.props].sort((x, y) => nameOf(x.player_id).localeCompare(nameOf(y.player_id)));
+    const autoCount = rows.filter(pr => propHistory(pr).length >= AUTO_THRESHOLD).length;
+    const openSlots = rows.filter(pr => !propActive(pr)).length;
+    return `<section class="stat-block">
+      <div class="stat-head">
+        <div><h3>${esc(sg.stat)}</h3><span class="prop-status">${rows.length} players · ${autoCount} auto · ${rows.length - autoCount} set by hand</span></div>
+        <button class="btn primary" data-post-stat="${esc(sg.stat)}" ${openSlots ? "" : "disabled"}>${openSlots ? "Post lines" : "All lines up"}</button>
+      </div>
+      <div class="stat-rows">${rows.map(propRow).join("")}</div>
+    </section>`;
+  }).join("");
 }
 
-function propCard(pr) {
-  const hist = propHistory(pr), active = propActive(pr), mineProp = pr.player_id === uid();
-  const n = hist.length, auto = n >= AUTO_THRESHOLD;
-  const recent = hist.slice(0, 8).map(b => `<span class="res num">${esc(String(Number(b.final_value)))}</span>`).join("");
-  const status = auto
-    ? `<span class="alt-tag">auto lines</span> Set from the last ${Math.min(n, 10)} results`
-    : `Lines set by hand · ${n} of ${AUTO_THRESHOLD} results until auto lines`;
-  let action;
-  if (active) {
-    const ov = active.outcomes[0], un = active.outcomes[1];
-    action = `<button class="prop-live" data-goto-bet="${esc(active.id)}"><span class="pill ${esc(active.status)}">${esc(active.status)}</span>
-      Line ${esc(String(Number(active.line)))} · O ${fmtOdds(priceOf(active, ov))} / U ${fmtOdds(priceOf(active, un))}<span class="go">View ›</span></button>`;
-  } else if (mineProp) {
-    action = `<p class="hint">This prop is about you. Someone else posts its lines.</p>`;
-  } else {
-    action = `<button class="btn primary" data-post-prop="${esc(pr.id)}">Post ${auto ? "auto " : ""}line</button>`;
-  }
-  return `<article class="prop card-ish">
-    <div class="prop-top"><b>${esc(pr.stat)}</b><span class="prop-status">${status}</span></div>
-    ${recent ? `<div class="results"><small>Recent</small>${recent}</div>` : ""}
-    ${action}
-  </article>`;
+function propRow(pr) {
+  const hist = propHistory(pr), active = propActive(pr), n = hist.length;
+  const recent = hist.slice(0, 5).map(b => `<span class="res num">${esc(String(Number(b.final_value)))}</span>`).join("");
+  const right = active
+    ? `<button class="prop-live" data-goto-bet="${esc(active.id)}"><span class="num">${esc(String(Number(active.line)))}</span><span class="go">›</span></button>`
+    : n >= AUTO_THRESHOLD ? `<span class="alt-tag">auto</span>` : `<span class="prop-status num">${n}/${AUTO_THRESHOLD}</span>`;
+  return `<div class="stat-row">
+    <span class="initial">${esc((nameOf(pr.player_id)[0] || "?").toUpperCase())}</span>
+    <div class="who"><b>${esc(pr.player_id === uid() ? "You" : nameOf(pr.player_id))}</b>${recent ? `<div class="results">${recent}</div>` : `<span class="prop-status">No results yet</span>`}</div>
+    ${right}
+  </div>`;
 }
 
-function openNewProp() {
-  const people = [...state.members].sort((a, b) => a.username.localeCompare(b.username));
-  let player = null;
-  sheet(`<h4>New player prop</h4>
-    <div class="f">Who's it about?<div class="chips hide-chips" id="np-people">${people.map(m =>
-      `<button type="button" data-np-player="${esc(m.id)}" aria-pressed="false">${esc(m.id === uid() ? m.username + " (you)" : m.username)}</button>`).join("")}</div></div>
-    <label class="f" for="np-stat">Stat<input class="inp" id="np-stat" maxlength="40" placeholder="Drinks"></label>
-    <div class="chips close-chips">${["Drinks", "Shots", "Minutes late", "Points", "Texts sent"].map(x => `<button type="button" data-np-stat="${x}">${x}</button>`).join("")}</div>
-    <span class="hint">Pick something you can count. The first ${AUTO_THRESHOLD} lines are set by hand, then the app takes over.</span>
-    <div class="err" id="np-err"></div>
-    <button class="btn primary big" id="np-save">Create prop</button>
+function openNewStat() {
+  sheet(`<h4>New stat line</h4><b>Everyone in the group gets a line for it.</b>
+    <label class="f" for="ns-stat">Stat<input class="inp" id="ns-stat" maxlength="40" placeholder="Drinks"></label>
+    <div class="chips close-chips">${["Drinks", "Shots", "Minutes late", "Points", "Texts sent"].map(x => `<button type="button" data-ns-stat="${x}">${x}</button>`).join("")}</div>
+    <span class="hint">Pick something you can count. People who join later get it too.</span>
+    <div class="err" id="ns-err"></div>
+    <button class="btn primary big" id="ns-save">Add stat line</button>
     <button class="btn big" data-close>Cancel</button>`);
-  document.querySelectorAll("[data-np-player]").forEach(btn => btn.onclick = () => {
-    player = btn.dataset.npPlayer;
-    document.querySelectorAll("[data-np-player]").forEach(x => x.setAttribute("aria-pressed", String(x === btn)));
-  });
-  document.querySelectorAll("[data-np-stat]").forEach(btn => btn.onclick = () => { $("#np-stat").value = btn.dataset.npStat; });
-  $("#np-save").onclick = async () => {
-    const stat = $("#np-stat").value.trim();
-    if (!player) return ($("#np-err").textContent = "Pick who the prop is about.");
-    if (!stat) return ($("#np-err").textContent = "Name the stat, like Drinks.");
-    $("#np-save").disabled = true;
-    const { error } = await sb.rpc("create_prop", { p_group: state.groupId, p_player: player, p_stat: stat });
-    if (error) { $("#np-err").textContent = errMsg(error); $("#np-save").disabled = false; return; }
-    closeSheet(); toast(`Prop created: ${nameOf(player)} · ${stat}`); loadGroupData();
+  document.querySelectorAll("[data-ns-stat]").forEach(btn => btn.onclick = () => { $("#ns-stat").value = btn.dataset.nsStat; });
+  $("#ns-save").onclick = async () => {
+    const stat = $("#ns-stat").value.trim();
+    if (!stat) return ($("#ns-err").textContent = "Name the stat, like Drinks.");
+    $("#ns-save").disabled = true;
+    const { data, error } = await sb.rpc("create_prop_stat", { p_group: state.groupId, p_stat: stat });
+    if (error) { $("#ns-err").textContent = errMsg(error); $("#ns-save").disabled = false; return; }
+    closeSheet(); toast(data ? `${stat} added for ${data} ${data === 1 ? "player" : "players"}` : `Everyone already has ${stat}`); loadGroupData();
   };
 }
 
@@ -499,54 +489,69 @@ function wireSheetTimePickers() {
   });
 }
 
-async function openPostProp(propId) {
-  const pr = state.props.find(p => p.id === propId); if (!pr) return;
-  const { data: sug, error } = await sb.rpc("prop_suggestion", { p_prop: propId });
+async function openPostSlate(stat) {
+  const { data: slate, error } = await sb.rpc("prop_slate", { p_group: state.groupId, p_stat: stat });
   if (error) return toast(errMsg(error));
   const others = state.members.filter(m => m.id !== uid()).sort((a, b) => a.username.localeCompare(b.username));
-  const hidden = new Set();
-  const lineBlock = sug.auto
-    ? `<div class="auto-line"><small>Line set automatically</small>
-        <b class="num">${esc(String(sug.line))}</b>
-        <span class="num">Over ${fmtOdds(sug.over_odds)} · Under ${fmtOdds(sug.under_odds)}</span>
-        <span class="hint">From ${nameOf(pr.player_id)}'s last ${sug.results} results (weighted average ${sug.mean}). Recent nights count more.</span></div>`
-    : `<label class="f" for="pp-line">Line<input class="inp num" id="pp-line" inputmode="decimal" placeholder="3.5"><span class="hint">${sug.results} of ${sug.needed} results so far. After ${sug.needed}, lines set themselves.</span></label>
-       <div class="orow two">
-         <label class="f" for="pp-over">Over odds${oddsField("pp-over", "-110")}</label>
-         <label class="f" for="pp-under">Under odds${oddsField("pp-under", "-110")}</label>
-       </div>`;
-  sheet(`<h4>Post a line</h4><b>${esc(nameOf(pr.player_id))} · ${esc(pr.stat)}</b>
-    ${lineBlock}
-    <div class="f">Starts${sheetTimePicker("pp-start", startPresets(), "", "Start date and time")}</div>
-    <div class="f">Ends${sheetTimePicker("pp-end", closePresets(), toLocalInput(nextAtHour(2)), "End date and time")}<span class="hint">Odds follow the clock from start to end. Betting closes at the end.</span></div>
+  const hidden = new Set(), include = new Set();
+  const rows = slate.map(r => {
+    const name = r.player_id === uid() ? "You" : r.username, sug = r.suggestion;
+    if (r.active_bet) return `<div class="slate-row off"><b>${esc(name)}</b><span class="prop-status">Line already up</span></div>`;
+    if (!sug.auto && r.player_id === uid()) return `<div class="slate-row off"><b>You</b><span class="prop-status">Someone else sets your line until it's auto (${sug.results}/${sug.needed})</span></div>`;
+    include.add(r.prop_id);
+    const toggle = `<button type="button" class="incl" data-incl="${esc(r.prop_id)}" aria-pressed="true" aria-label="Include ${esc(name)}">✓</button>`;
+    if (sug.auto) return `<div class="slate-row auto" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}</b>
+      <div class="auto-mini"><span class="alt-tag">auto</span><b class="num">${esc(String(sug.line))}</b><span class="num">O ${fmtOdds(sug.over_odds)} · U ${fmtOdds(sug.under_odds)}</span></div></div>`;
+    return `<div class="slate-row manual" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}<small class="prop-status"> ${sug.results}/${sug.needed} results</small></b>
+      <div class="manual-inputs">
+        <label class="f" for="sl-line-${esc(r.prop_id)}">Line<input class="inp num" id="sl-line-${esc(r.prop_id)}" inputmode="decimal" placeholder="3.5"></label>
+        <label class="f" for="sl-over-${esc(r.prop_id)}">Over${oddsField(`sl-over-${r.prop_id}`, "-110")}</label>
+        <label class="f" for="sl-under-${esc(r.prop_id)}">Under${oddsField(`sl-under-${r.prop_id}`, "-110")}</label>
+      </div></div>`;
+  }).join("");
+  sheet(`<h4>Post lines</h4><b>${esc(stat)}</b>
+    <div class="slate">${rows}</div>
+    <div class="f">Starts${sheetTimePicker("sl-start", startPresets(), "", "Start date and time")}</div>
+    <div class="f">Ends${sheetTimePicker("sl-end", closePresets(), toLocalInput(nextAtHour(2)), "End date and time")}<span class="hint">One start and end for every line here. Odds follow the clock in between.</span></div>
     ${others.length ? `<div class="f">Hide from (optional)<div class="chips hide-chips">${others.map(m =>
-      `<button type="button" data-pp-hide="${esc(m.id)}" aria-pressed="false">${esc(m.username)}</button>`).join("")}</div></div>` : ""}
-    <div class="err" id="pp-err"></div>
-    <button class="btn primary big" id="pp-save">Post line</button>
+      `<button type="button" data-sl-hide="${esc(m.id)}" aria-pressed="false">${esc(m.username)}</button>`).join("")}</div></div>` : ""}
+    <div class="err" id="sl-err"></div>
+    <button class="btn primary big" id="sl-save">Post lines</button>
     <button class="btn big" data-close>Cancel</button>`);
   wireSheetTimePickers();
-  document.querySelectorAll("[data-pp-hide]").forEach(btn => btn.onclick = () => {
-    const id = btn.dataset.ppHide; hidden.has(id) ? hidden.delete(id) : hidden.add(id);
+  const countLabel = () => { const n = include.size; $("#sl-save").textContent = n ? `Post ${n} ${n === 1 ? "line" : "lines"}` : "Pick at least one player"; $("#sl-save").disabled = !n; };
+  document.querySelectorAll("[data-incl]").forEach(btn => btn.onclick = () => {
+    const id = btn.dataset.incl; include.has(id) ? include.delete(id) : include.add(id);
+    btn.setAttribute("aria-pressed", String(include.has(id)));
+    document.querySelector(`[data-row="${id}"]`)?.classList.toggle("skipped", !include.has(id));
+    countLabel();
+  });
+  document.querySelectorAll("[data-sl-hide]").forEach(btn => btn.onclick = () => {
+    const id = btn.dataset.slHide; hidden.has(id) ? hidden.delete(id) : hidden.add(id);
     btn.setAttribute("aria-pressed", String(hidden.has(id)));
   });
-  $("#pp-save").onclick = async () => {
-    const err = $("#pp-err"), start = $("#pp-start").value, end = $("#pp-end").value;
-    let line = null, ov = null, un = null;
-    if (!sug.auto) {
-      line = Number($("#pp-line").value);
-      ov = Number(oddsValue("pp-over")); un = Number(oddsValue("pp-under"));
-      if ($("#pp-line").value.trim() === "" || !Number.isFinite(line) || line < 0) return (err.textContent = "Set a line, like 3.5.");
-      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds need at least 100 (like −110 or +120). Tap ± to switch minus and plus.");
+  countLabel();
+  $("#sl-save").onclick = async () => {
+    const err = $("#sl-err"), start = $("#sl-start").value, end = $("#sl-end").value;
+    const lines = [];
+    for (const r of slate) {
+      if (!include.has(r.prop_id)) continue;
+      if (r.suggestion.auto) { lines.push({ prop_id: r.prop_id }); continue; }
+      const lv = $(`#sl-line-${r.prop_id}`).value.trim(), line = Number(lv);
+      const ov = Number(oddsValue(`sl-over-${r.prop_id}`)), un = Number(oddsValue(`sl-under-${r.prop_id}`));
+      const who = r.player_id === uid() ? "your" : `${r.username}'s`;
+      if (lv === "" || !Number.isFinite(line) || line < 0) return (err.textContent = `Set ${who} line, like 3.5, or uncheck them.`);
+      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = `${who[0].toUpperCase() + who.slice(1)} odds need at least 100 (like −110). Tap ± to switch minus and plus.`);
+      lines.push({ prop_id: r.prop_id, line, over: ov, under: un });
     }
     if (end && new Date(end) <= new Date()) return (err.textContent = "Pick an end time in the future.");
     if (start && end && new Date(start) >= new Date(end)) return (err.textContent = "The end has to be after the start.");
-    $("#pp-save").disabled = true;
-    const { error } = await sb.rpc("create_prop_bet", {
-      p_prop: propId, p_line: line, p_over_odds: ov, p_under_odds: un,
-      p_closes_at: end ? new Date(end).toISOString() : null, p_starts_at: start ? new Date(start).toISOString() : null,
-      p_hidden: [...hidden] });
-    if (error) { err.textContent = errMsg(error); $("#pp-save").disabled = false; return; }
-    closeSheet(); toast("Line posted"); state.tab = "board"; state.filter = "open"; loadGroupData();
+    $("#sl-save").disabled = true;
+    const { data, error } = await sb.rpc("create_prop_slate", {
+      p_lines: lines, p_closes_at: end ? new Date(end).toISOString() : null,
+      p_starts_at: start ? new Date(start).toISOString() : null, p_hidden: [...hidden] });
+    if (error) { err.textContent = errMsg(error); $("#sl-save").disabled = false; return; }
+    closeSheet(); toast(`Posted ${data} ${stat} ${data === 1 ? "line" : "lines"}`); state.tab = "board"; state.filter = "open"; loadGroupData();
   };
 }
 
@@ -831,8 +836,8 @@ document.addEventListener("click", async e => {
     try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
     return;
   }
-  if (t.id === "newProp") return openNewProp();
-  if (t.dataset.postProp) return openPostProp(t.dataset.postProp);
+  if (t.id === "newStat") return openNewStat();
+  if (t.dataset.postStat) return openPostSlate(t.dataset.postStat);
   if (t.dataset.gotoBet) {
     const b = betById(t.dataset.gotoBet);
     state.tab = "board"; state.filter = b?.status === "locked" ? "locked" : "open"; render();
