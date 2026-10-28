@@ -6,7 +6,7 @@ const configured = cfg.supabaseUrl && !cfg.supabaseUrl.includes("YOUR-PROJECT") 
 const sb = configured ? window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey) : null;
 
 const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdds: "-110", underOdds: "-110",
-  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [], closesAt: "" });
+  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [], closesAt: "", startsAt: "" });
 
 const state = {
   session: null, groups: [], groupId: null,
@@ -40,16 +40,55 @@ function calibrateLambda(k, p) {
   for (let i = 0; i < 80; i++) { const mid = (lo + hi) / 2; poissonAtLeast(k, mid) < p ? lo = mid : hi = mid; }
   return (lo + hi) / 2;
 }
-function liveQuote(b, current, progress) {
+// Pricing — mirrors private.bet_progress / price_ou / price_custom in supabase/schema.sql.
+const MARKET_TEMPERATURE = 10000;   // tokens of net money that shift the log-odds by 1
+const startOf = b => new Date(b.starts_at || b.created_at).getTime();
+const hasStarted = (b, t = Date.now()) => t >= startOf(b);
+function progressAt(b, t = Date.now()) {
+  if (!b.closes_at) return 0;
+  const start = startOf(b), span = new Date(b.closes_at).getTime() - start;
+  if (!(span > 0)) return 0;
+  const minute = Math.floor(t / 60000) * 60000;
+  return Math.min(1, Math.max(0, (minute - start) / span));
+}
+function ouModel(b) {
+  if (b.live_lambda != null) return { lam: b.live_lambda, ovr: b.live_overround };
   const [ov, un] = b.outcomes;
-  let lambda = b.live_lambda, over = b.live_overround;
-  if (lambda == null) {
-    const qo = impliedProb(ov.open_odds ?? ov.odds), qu = impliedProb(un.open_odds ?? un.odds);
-    lambda = calibrateLambda(Math.floor(Number(b.line)) + 1, Math.min(Math.max(qo / (qo + qu), 0.01), 0.99));
-    over = qo + qu;
+  const qo = impliedProb(ov.open_odds ?? ov.odds), qu = impliedProb(un.open_odds ?? un.odds);
+  return { lam: calibrateLambda(Math.floor(Number(b.line)) + 1, Math.min(Math.max(qo / (qo + qu), 0.01), 0.99)), ovr: qo + qu };
+}
+function sideStakes(b) {
+  let over = 0, under = 0;
+  for (const w of state.wagers) if (w.bet_id === b.id) {
+    ((w.side || (w.outcome_id === b.outcomes[0].id ? "over" : "under")) === "over") ? over += w.stake : under += w.stake;
   }
-  const pOver = poissonAtLeast(Math.floor(Number(b.line) - current) + 1, lambda * (1 - progress));
-  return { over: toAmerican(pOver * over), under: toAmerican((1 - pOver) * over), decided: current > Number(b.line) || progress >= 1, pOver };
+  return { over, under };
+}
+function priceOU(b, line, side, t = Date.now()) {
+  const [ov, un] = b.outcomes, s = sideStakes(b), cur = Number(b.live_current ?? 0), prog = progressAt(b, t);
+  if (s.over === 0 && s.under === 0 && cur === 0 && prog === 0 && line === Number(b.line))
+    return side === "over" ? (ov.open_odds ?? ov.odds) : (un.open_odds ?? un.odds);
+  const m = ouModel(b);
+  let p = poissonAtLeast(Math.floor(line - cur) + 1, m.lam * (1 - prog));
+  p = Math.min(Math.max(p, 1e-6), 1 - 1e-6);
+  p = 1 / (1 + Math.exp(-(Math.log(p / (1 - p)) + (s.over - s.under) / MARKET_TEMPERATURE)));
+  return toAmerican((side === "over" ? p : 1 - p) * m.ovr);
+}
+function priceCustom(b, o) {
+  const stakeOn = id => state.wagers.reduce((a, w) => a + (w.bet_id === b.id && w.outcome_id === id ? w.stake : 0), 0);
+  if (state.wagers.every(w => w.bet_id !== b.id)) return o.open_odds ?? o.odds;
+  const ovr = b.outcomes.reduce((a, x) => a + impliedProb(x.open_odds ?? x.odds), 0);
+  let num = 0, den = 0;
+  for (const x of b.outcomes) {
+    const v = impliedProb(x.open_odds ?? x.odds) / ovr * Math.exp(stakeOn(x.id) / MARKET_TEMPERATURE);
+    den += v; if (x.id === o.id) num = v;
+  }
+  return toAmerican(num / den * ovr);
+}
+// Current price of an outcome as the server would quote it now. Final bets show what was stored.
+function priceOf(b, o) {
+  if (b.status !== "open" && b.status !== "locked") return o.odds;
+  return b.line != null ? priceOU(b, Number(b.line), o.position === 0 ? "over" : "under") : priceCustom(b, o);
 }
 // Closing-time helpers. Inputs use the device's local time; the server stores UTC.
 const pad2 = n => String(n).padStart(2, "0");
@@ -70,27 +109,19 @@ function leftText(iso) {
   const h = Math.floor(m / 60); return h < 48 ? `${h}h ${m % 60}m left` : `${Math.round(h / 24)} days left`;
 }
 const isPast = iso => iso && new Date(iso) <= new Date();
-function clockProgress(b) {
-  if (!b.closes_at) return null;
-  const start = new Date(b.created_at), end = new Date(b.closes_at);
-  return Math.min(1, Math.max(0, (Date.now() - start) / (end - start)));
+function startPresets() {
+  const inHour = new Date(Date.now() + 3600e3); inHour.setSeconds(0, 0);
+  return [["now", "Now", ""], ["1h", "In 1 hour", toLocalInput(inHour)], ["8pm", "8 PM", toLocalInput(nextAtHour(20))], ["10pm", "10 PM", toLocalInput(nextAtHour(22))]];
+}
+function startPicker(value) {
+  return `<div class="chips close-chips">${startPresets().map(([k, l, v]) =>
+      `<button type="button" data-start-preset="c" data-v="${v}" aria-pressed="${value === v}">${l}</button>`).join("")}</div>
+    <input class="inp num" type="datetime-local" id="c-start" value="${esc(value)}" aria-label="Start date and time">`;
 }
 function closePicker(prefix, value) {
   return `<div class="chips close-chips">${closePresets().map(([k, l, v]) =>
       `<button type="button" data-close-preset="${prefix}" data-v="${v}" aria-pressed="${value === v}">${l}</button>`).join("")}</div>
     <input class="inp num" type="datetime-local" id="${prefix}-at" value="${esc(value)}" aria-label="Closing date and time">`;
-}
-// Price one side of an O/U bet at any line, from the bet's live state (mirrors private.ou_price).
-function ouPrice(b, line, side) {
-  const [ov, un] = b.outcomes;
-  let lambda = b.live_lambda, over = b.live_overround;
-  if (lambda == null) {
-    const qo = impliedProb(ov.open_odds ?? ov.odds), qu = impliedProb(un.open_odds ?? un.odds);
-    lambda = calibrateLambda(Math.floor(Number(b.line)) + 1, Math.min(Math.max(qo / (qo + qu), 0.01), 0.99));
-    over = qo + qu;
-  }
-  const pOver = poissonAtLeast(Math.floor(line - Number(b.live_current ?? 0)) + 1, lambda * (1 - Number(b.live_progress ?? 0)));
-  return toAmerican((side === "over" ? pOver : 1 - pOver) * over);
 }
 // Step to the next/previous half-point line (alternate lines always end in .5).
 const lineUp = l => Math.floor(l) + 0.5 > l ? Math.floor(l) + 0.5 : Math.floor(l) + 1.5;
@@ -277,16 +308,16 @@ function betCard(b) {
     const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
     return `<button class="out ${cls}" data-bet="${esc(b.id)}" data-out="${esc(o.id)}" ${canBet ? "" : "disabled"}>
       <span class="lbl">${esc(o.label)}</span>
-      <span class="odds num">${fmtOdds(o.odds)}</span>
-      ${o.open_odds != null && o.open_odds !== o.odds ? `<span class="opened num">opened ${fmtOdds(o.open_odds)}</span>` : ""}
+      <span class="odds num">${fmtOdds(priceOf(b, o))}</span>
+      ${o.open_odds != null && o.open_odds !== priceOf(b, o) ? `<span class="opened num">opened ${fmtOdds(o.open_odds)}</span>` : ""}
       <span class="pool num">${fmtTok(pool[o.id] || 0)} wagered${cls === "won" ? " · winner" : ""}</span>
       ${mineBy[o.id] ? `<span class="mine num">You: ${fmtTok(mineBy[o.id])}</span>` : ""}
     </button>`;
   }).join("");
   const live = b.status === "open" || b.status === "locked";
   const ctl = live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
-      ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live update</button>` : ""}
-      <button class="btn" data-act="closetime" data-bet="${esc(b.id)}">Close time</button>
+      ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live count</button>` : ""}
+      <button class="btn" data-act="closetime" data-bet="${esc(b.id)}">End time</button>
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
       <button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button>
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
@@ -295,13 +326,12 @@ function betCard(b) {
       <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
-      ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Betting closed at ${esc(fmtClose(b.closes_at))}` : `Betting closes ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
+      ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Betting closed at ${esc(fmtClose(b.closes_at))}` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
       ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
       ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
       ${mine && open ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
-      ${b.live_updated_at ? `<div class="livebar"><span class="dot${live ? "" : " off"}"></span><b class="num">${esc(String(Number(b.live_current)))}</b>&nbsp;so far · <span class="num">${Math.round(Number(b.live_progress) * 100)}%</span>&nbsp;through<span class="when">${agoText(b.live_updated_at)}</span>
-        <div class="prog" aria-hidden="true"><i style="width:${Math.round(Number(b.live_progress) * 100)}%"></i></div></div>` : ""}
+      ${liveBar(b, live)}
     </div>
     <div class="outs">${outs}</div>${ctl}
   </article>`;
@@ -322,6 +352,14 @@ function oddsValue(id) {
   const digits = input.value.replace(/[^0-9]/g, "");
   if (!digits) return "";
   return (btn?.textContent.trim().startsWith("−") ? "-" : "+") + digits;
+}
+
+function liveBar(b, live) {
+  if (b.line == null || !b.closes_at || !live) return "";
+  if (!hasStarted(b)) return `<div class="livebar"><span class="dot off"></span>Starts&nbsp;<b>${esc(fmtClose(b.starts_at || b.created_at))}</b><span class="when">odds frozen until then</span></div>`;
+  const pct = Math.round(progressAt(b) * 100);
+  return `<div class="livebar"><span class="dot"></span><b class="num">${esc(String(Number(b.live_current ?? 0)))}</b>&nbsp;so far · <span class="num">${pct}%</span>&nbsp;through${b.live_updated_at ? `<span class="when">count ${agoText(b.live_updated_at)}</span>` : ""}
+    <div class="prog" aria-hidden="true"><i style="width:${pct}%"></i></div></div>`;
 }
 
 function createHTML() {
@@ -349,7 +387,8 @@ function createHTML() {
     <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
     <label class="f" for="c-detail">Details (optional)<input class="inp" id="c-detail" maxlength="240" placeholder="Settled by stopwatch at the table" value="${esc(d.detail)}"></label>
     ${body}
-    <div class="f">Betting closes${closePicker("c", state.draft.closesAt)}<span class="hint">Your local time. Wagers stop automatically at this time.</span></div>
+    <div class="f">Starts${startPicker(state.draft.startsAt)}<span class="hint">Odds hold at your opening line until the start. People can bet early.</span></div>
+    <div class="f">Ends${closePicker("c", state.draft.closesAt)}<span class="hint">Betting closes at the end. Over/under odds follow the clock between start and end.</span></div>
     ${hidePicker()}
     <div class="err" id="c-err"></div>
     <button class="btn primary big" type="submit">Post bet</button>
@@ -418,7 +457,7 @@ function openWager(betId, outId) {
   const maxLine = main * 4 + 20;
   let side = o.position === 0 ? "over" : "under", line = main;
   const outcomeFor = sd => b.outcomes[sd === "over" ? 0 : 1];
-  const price = () => !ou ? o.odds : line === main ? outcomeFor(side).odds : ouPrice(b, line, side);
+  const price = () => !ou ? priceOf(b, o) : priceOU(b, line, side);
   const label = () => !ou ? o.label : line === main ? outcomeFor(side).label : `${sideLabel(side)} ${line}`;
 
   sheet(`<h4>${esc(b.title)}</h4>
@@ -481,48 +520,43 @@ function openWager(betId, outId) {
 function openLive(betId) {
   const b = betById(betId); if (!b) return;
   const line = Number(b.line);
-  let cur = Number(b.live_current ?? 0), prog = Math.round(Number(b.live_progress ?? 0) * 100);
-  const clock = clockProgress(b);
-  if (clock != null) prog = Math.round(clock * 20) * 5;
-  sheet(`<h4>Live update: ${esc(b.title)}</h4>
+  if (!b.closes_at) return toast("Give this bet an end time first (End time button) so the odds can follow the clock.");
+  if (!hasStarted(b)) return toast(`This starts ${fmtClose(b.starts_at || b.created_at)}. Count updates open then.`);
+  const pct = Math.round(progressAt(b) * 100);
+  sheet(`<h4>Live count: ${esc(b.title)}</h4>
     <div class="f">Count so far · line ${esc(b.line)}
       <div class="stepper"><button type="button" id="l-minus" aria-label="Decrease count">−</button>
-        <input class="inp num" id="l-cur" inputmode="decimal" value="${cur}">
+        <input class="inp num" id="l-cur" inputmode="decimal" value="${Number(b.live_current ?? 0)}">
         <button type="button" id="l-plus" aria-label="Increase count">+</button></div></div>
-    <label class="f" for="l-prog">How far through the event · <span class="num" id="l-prog-v">${prog}%</span>
-      <input type="range" id="l-prog" min="0" max="100" step="5" value="${prog}"></label>
-    ${clock != null ? `<span class="hint">Set from the clock: ${Math.round(clock * 100)}% of the way from when you posted it to ${esc(fmtClose(b.closes_at))}. Adjust if the event started later.</span>` : ""}
+    <span class="hint">${pct}% through by the clock (start ${esc(fmtClose(b.starts_at || b.created_at))}, end ${esc(fmtClose(b.closes_at))}). The odds keep moving with the clock on their own.</span>
     <div class="quote">
       <div><small>${esc(b.outcomes[0].label)}</small><b class="num" id="q-over"></b><span class="num" id="q-over-was"></span></div>
       <div><small>${esc(b.outcomes[1].label)}</small><b class="num" id="q-under"></b><span class="num" id="q-under-was"></span></div>
     </div>
     <span class="hint" id="l-note"></span>
     <div class="err" id="l-err"></div>
-    <button class="btn primary big" id="l-save">Update odds</button>
+    <button class="btn primary big" id="l-save">Update count</button>
     <button class="btn big" data-close>Cancel</button>`);
-  const curEl = $("#l-cur"), progEl = $("#l-prog");
-  const read = () => ({ c: Math.max(0, Number(curEl.value) || 0), p: Number(progEl.value) / 100 });
+  const curEl = $("#l-cur");
+  const read = () => Math.max(0, Number(curEl.value) || 0);
   const paint = () => {
-    const { c, p } = read();
-    $("#l-prog-v").textContent = Math.round(p * 100) + "%";
-    const q = liveQuote(b, c, p);
-    $("#q-over").textContent = fmtOdds(q.over); $("#q-under").textContent = fmtOdds(q.under);
-    $("#q-over-was").textContent = "now " + fmtOdds(b.outcomes[0].odds); $("#q-under-was").textContent = "now " + fmtOdds(b.outcomes[1].odds);
-    $("#l-note").textContent = c > line ? `Over has hit. Saving locks the bet so you can settle it.`
-      : p >= 1 ? `Event finished under the line. Saving locks the bet so you can settle it.`
-      : `Chance of going over: ${Math.round(q.pOver * 100)}%. Wagers already placed keep their odds.`;
+    const c = read(), preview = { ...b, live_current: c };
+    $("#q-over").textContent = fmtOdds(priceOU(preview, line, "over"));
+    $("#q-under").textContent = fmtOdds(priceOU(preview, line, "under"));
+    $("#q-over-was").textContent = "now " + fmtOdds(priceOf(b, b.outcomes[0]));
+    $("#q-under-was").textContent = "now " + fmtOdds(priceOf(b, b.outcomes[1]));
+    $("#l-note").textContent = c > line ? "Over has hit. Saving locks the bet so you can settle it." : "Wagers already placed keep their odds.";
   };
   $("#l-minus").onclick = () => { curEl.value = Math.max(0, (Number(curEl.value) || 0) - 1); paint(); };
   $("#l-plus").onclick = () => { curEl.value = (Number(curEl.value) || 0) + 1; paint(); };
-  curEl.addEventListener("input", paint); progEl.addEventListener("input", paint);
+  curEl.addEventListener("input", paint);
   paint();
   $("#l-save").onclick = async () => {
-    const { c, p } = read();
     $("#l-save").disabled = true;
-    const { data, error } = await sb.rpc("update_live_odds", { p_bet: betId, p_current: c, p_progress: p });
+    const { data, error } = await sb.rpc("update_live_count", { p_bet: betId, p_current: read() });
     if (error) { $("#l-err").textContent = errMsg(error); $("#l-save").disabled = false; return; }
     closeSheet();
-    toast(data?.status === "locked" && b.status === "open" ? "Odds updated. The bet is decided, so it's locked. Settle it when ready." : "Live odds updated");
+    toast(data?.status === "locked" && b.status === "open" ? "Over has hit, so the bet is locked. Settle it when ready." : "Count updated");
     loadGroupData();
   };
 }
@@ -530,10 +564,10 @@ function openLive(betId) {
 function openCloseTime(betId) {
   const b = betById(betId); if (!b) return;
   const cur = b.closes_at ? toLocalInput(new Date(b.closes_at)) : "";
-  sheet(`<h4>Closing time: ${esc(b.title)}</h4>
-    <div class="f">Betting closes${closePicker("t", cur)}<span class="hint">Your local time. Clear it for no limit.</span></div>
+  sheet(`<h4>End time: ${esc(b.title)}</h4>
+    <div class="f">Ends${closePicker("t", cur)}<span class="hint">Your local time. Clear it for no end time.</span></div>
     <div class="err" id="t-err"></div>
-    <button class="btn primary big" id="t-save">Save closing time</button>
+    <button class="btn primary big" id="t-save">Save end time</button>
     <button class="btn big" data-close>Cancel</button>`);
   document.querySelectorAll('[data-close-preset="t"]').forEach(btn => btn.onclick = () => {
     $("#t-at").value = btn.dataset.v;
@@ -630,6 +664,7 @@ function syncDraft() {
   if (oddsValue("c-over") !== undefined) d.overOdds = oddsValue("c-over");
   if (oddsValue("c-under") !== undefined) d.underOdds = oddsValue("c-under");
   if (document.getElementById("c-at")) d.closesAt = document.getElementById("c-at").value;
+  if (document.getElementById("c-start")) d.startsAt = document.getElementById("c-start").value;
   document.querySelectorAll("[data-ol]").forEach(el => d.outcomes[+el.dataset.ol].label = el.value);
   document.querySelectorAll("[data-oo]").forEach(el => d.outcomes[+el.dataset.oo].odds = oddsValue(el.id));
 }
@@ -659,6 +694,7 @@ document.addEventListener("click", async e => {
   }
   if (!t.closest("#app")) return;
   if (t.dataset.filter) { state.filter = t.dataset.filter; return render(); }
+  if (t.dataset.startPreset === "c") { syncDraft(); state.draft.startsAt = t.dataset.v; return render(); }
   if (t.dataset.closePreset === "c") { syncDraft(); state.draft.closesAt = t.dataset.v; return render(); }
   if (t.dataset.hide) {
     syncDraft();
@@ -737,9 +773,10 @@ document.addEventListener("submit", async e => {
       if (outcomes.some(o => !o.label)) return (err.textContent = "Every outcome needs a name.");
       if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds need at least 100 (like −110 or +250). Tap ± to switch minus and plus.");
     }
-    if (d.closesAt && new Date(d.closesAt) <= new Date()) return (err.textContent = "Pick a closing time in the future.");
+    if (d.closesAt && new Date(d.closesAt) <= new Date()) return (err.textContent = "Pick an end time in the future.");
+    if (d.startsAt && d.closesAt && new Date(d.startsAt) >= new Date(d.closesAt)) return (err.textContent = "The end has to be after the start.");
     busy(true);
-    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden, p_closes_at: d.closesAt ? new Date(d.closesAt).toISOString() : null });
+    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden, p_closes_at: d.closesAt ? new Date(d.closesAt).toISOString() : null, p_starts_at: d.startsAt ? new Date(d.startsAt).toISOString() : null });
     busy(false);
     if (error) return (err.textContent = errMsg(error));
     state.draft = { ...blankDraft(), type: d.type };

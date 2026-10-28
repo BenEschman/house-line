@@ -868,3 +868,272 @@ begin
     where m.group_id = b.group_id and m.user_id = s.user_id;
   update bets set status = 'settled', winning_outcome_id = p_winner, settled_at = now() where id = p_bet;
 end $$;
+
+-------------------------------------------------------------------------------
+-- Clock-driven progress, start times, and market moves.
+--  * Progress = how far now is between start (starts_at, else created_at) and end (closes_at).
+--  * Before the start, clock/count pricing is frozen; count updates are refused.
+--  * Odds shift with the money: log-odds move by (stake on side - stake on other) / 10,000.
+-------------------------------------------------------------------------------
+
+alter table public.bets add column starts_at timestamptz;
+
+create or replace function private.market_temperature()
+returns double precision language sql immutable as $$ select 10000.0::double precision $$;
+
+create or replace function private.bet_progress(b public.bets, at timestamptz)
+returns double precision language sql stable as $$
+  select case when b.closes_at is null then 0::float8 else
+    least(1::float8, greatest(0::float8,
+      (extract(epoch from (date_trunc('minute', at) - coalesce(b.starts_at, b.created_at)))
+       / nullif(extract(epoch from (b.closes_at - coalesce(b.starts_at, b.created_at))), 0))::float8))
+  end
+$$;
+
+create or replace function private.ou_model(b public.bets, out lam double precision, out ovr double precision)
+language plpgsql stable security definer set search_path = public, private as $$
+declare o_over outcomes; o_under outcomes; q_o double precision; q_u double precision;
+begin
+  lam := b.live_lambda; ovr := b.live_overround;
+  if lam is null then
+    select * into o_over  from outcomes where bet_id = b.id and position = 0;
+    select * into o_under from outcomes where bet_id = b.id and position = 1;
+    q_o := american_to_prob(coalesce(o_over.open_odds, o_over.odds));
+    q_u := american_to_prob(coalesce(o_under.open_odds, o_under.odds));
+    lam := calibrate_lambda(floor(b.line)::int + 1, least(greatest(q_o / (q_o + q_u), 0.01), 0.99));
+    ovr := q_o + q_u;
+  end if;
+end $$;
+
+create or replace function private.price_ou(b public.bets, p_line numeric, p_side text, at timestamptz)
+returns int language plpgsql stable security definer set search_path = public, private as $$
+declare
+  o_over outcomes; o_under outcomes; m record;
+  cur numeric := coalesce(b.live_current, 0); prog double precision;
+  s_over double precision; s_under double precision; p double precision; z double precision;
+begin
+  select * into o_over  from outcomes where bet_id = b.id and position = 0;
+  select * into o_under from outcomes where bet_id = b.id and position = 1;
+  select coalesce(sum(stake) filter (where coalesce(side, case when outcome_id = o_over.id then 'over' else 'under' end) = 'over'), 0),
+         coalesce(sum(stake) filter (where coalesce(side, case when outcome_id = o_over.id then 'over' else 'under' end) = 'under'), 0)
+    into s_over, s_under from wagers where bet_id = b.id;
+  prog := bet_progress(b, at);
+  if s_over = 0 and s_under = 0 and cur = 0 and prog = 0 and p_line = b.line then
+    return case when p_side = 'over' then coalesce(o_over.open_odds, o_over.odds) else coalesce(o_under.open_odds, o_under.odds) end;
+  end if;
+  select * into m from ou_model(b);
+  p := poisson_at_least(floor(p_line - cur)::int + 1, m.lam * (1 - prog));
+  p := least(greatest(p, 1e-6), 1 - 1e-6);
+  z := ln(p / (1 - p)) + (s_over - s_under) / market_temperature();
+  p := 1 / (1 + exp(-z));
+  return prob_to_american((case when p_side = 'over' then p else 1 - p end) * m.ovr);
+end $$;
+
+create or replace function private.price_custom(b public.bets, p_outcome uuid)
+returns int language plpgsql stable security definer set search_path = public, private as $$
+declare ovr double precision; num double precision := 0; den double precision := 0; r record; tot double precision;
+begin
+  select coalesce(sum(stake), 0) into tot from wagers where bet_id = b.id;
+  if tot = 0 then return (select coalesce(open_odds, odds) from outcomes where id = p_outcome); end if;
+  select sum(american_to_prob(coalesce(open_odds, odds))) into ovr from outcomes where bet_id = b.id;
+  for r in
+    select o.id, american_to_prob(coalesce(o.open_odds, o.odds)) / ovr as p,
+           coalesce((select sum(w.stake) from wagers w where w.outcome_id = o.id), 0)::float8 as s
+    from outcomes o where o.bet_id = b.id
+  loop
+    den := den + r.p * exp(r.s / market_temperature());
+    if r.id = p_outcome then num := r.p * exp(r.s / market_temperature()); end if;
+  end loop;
+  return prob_to_american(num / den * ovr);
+end $$;
+
+create or replace function private.price_outcome(b public.bets, o public.outcomes, p_line numeric, p_side text, at timestamptz)
+returns int language sql stable security definer set search_path = public, private as $$
+  select case when b.line is null then price_custom(b, o.id)
+              else price_ou(b, coalesce(p_line, b.line),
+                            coalesce(p_side, case when o.position = 0 then 'over' else 'under' end), at) end
+$$;
+
+create or replace function private.reprice_bet(p_bet uuid)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  select * into b from bets where id = p_bet;
+  if not found or b.status not in ('open', 'locked') then return; end if;
+  update outcomes o set odds = price_outcome(b, o, null, null, now()) where o.bet_id = p_bet;
+end $$;
+
+create or replace function private.odds_close(a int, b int)
+returns boolean language sql immutable set search_path = public, private as $$
+  select abs(american_to_prob(a) - american_to_prob(b)) <= 0.004
+$$;
+
+revoke execute on function private.ou_model(public.bets) from public, anon, authenticated;
+revoke execute on function private.price_ou(public.bets, numeric, text, timestamptz) from public, anon, authenticated;
+revoke execute on function private.price_custom(public.bets, uuid) from public, anon, authenticated;
+revoke execute on function private.price_outcome(public.bets, public.outcomes, numeric, text, timestamptz) from public, anon, authenticated;
+revoke execute on function private.reprice_bet(uuid) from public, anon, authenticated;
+
+create or replace function private.do_wager(p_bet uuid, p_outcome uuid, p_side text, p_line numeric, p_stake int, p_expected int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare b bets; o outcomes; m memberships; w wagers; now_p int; prev_p int; use_odds int;
+begin
+  select * into b from bets where id = p_bet for share;
+  if not found or hidden_from_me(p_bet) or not is_member(b.group_id) then raise exception 'That bet no longer exists'; end if;
+  if b.creator_id = auth.uid() then raise exception 'You can''t bet on your own line'; end if;
+  if b.closes_at is not null and now() >= b.closes_at then raise exception 'Betting on this closed'; end if;
+  if b.status <> 'open' then raise exception 'This bet is closed to new wagers'; end if;
+  if p_stake is null or p_stake < 1 then raise exception 'Stake must be at least 1 token'; end if;
+  if p_outcome is null then
+    select * into o from outcomes where bet_id = b.id and position = case when p_side = 'over' then 0 else 1 end;
+  else
+    select * into o from outcomes where id = p_outcome and bet_id = b.id;
+    if not found then raise exception 'That outcome no longer exists'; end if;
+  end if;
+  now_p := price_outcome(b, o, p_line, p_side, now());
+  if p_expected is null then
+    use_odds := now_p;
+  else
+    prev_p := price_outcome(b, o, p_line, p_side, now() - interval '1 minute');
+    if odds_close(p_expected, now_p) or odds_close(p_expected, prev_p) then
+      use_odds := p_expected;
+    else
+      raise exception 'Odds moved to %. Check the new price and try again.',
+        case when now_p > 0 then '+' || now_p else now_p::text end;
+    end if;
+  end if;
+  select * into m from memberships where group_id = b.group_id and user_id = auth.uid() for update;
+  if not found then raise exception 'You are not in this group'; end if;
+  if m.balance < p_stake then raise exception 'Not enough tokens: you have %', m.balance; end if;
+  update memberships set balance = balance - p_stake where group_id = b.group_id and user_id = auth.uid();
+  insert into wagers (group_id, bet_id, outcome_id, user_id, stake, odds, line, side)
+    values (b.group_id, b.id, o.id, auth.uid(), p_stake, use_odds,
+            case when p_outcome is null then p_line end, case when p_outcome is null then p_side end)
+    returning * into w;
+  perform reprice_bet(b.id);
+  return w;
+end $$;
+revoke execute on function private.do_wager(uuid, uuid, text, numeric, int, int) from public, anon, authenticated;
+
+create or replace function public.place_wager(p_outcome uuid, p_stake int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare bet uuid;
+begin
+  select bet_id into bet from outcomes where id = p_outcome;
+  if bet is null then raise exception 'That outcome no longer exists'; end if;
+  return do_wager(bet, p_outcome, null, null, p_stake, null);
+end $$;
+
+create or replace function public.place_wager(p_outcome uuid, p_stake int, p_expected_odds int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare bet uuid;
+begin
+  select bet_id into bet from outcomes where id = p_outcome;
+  if bet is null then raise exception 'That outcome no longer exists'; end if;
+  return do_wager(bet, p_outcome, null, null, p_stake, p_expected_odds);
+end $$;
+
+create or replace function public.place_alt_wager(
+  p_bet uuid, p_side text, p_line numeric, p_stake int, p_expected_odds int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  if p_side not in ('over', 'under') then raise exception 'Pick over or under'; end if;
+  select * into b from bets where id = p_bet;
+  if not found or hidden_from_me(p_bet) then raise exception 'That bet no longer exists'; end if;
+  if b.line is null then raise exception 'Only over/under bets have alternate lines'; end if;
+  if p_line is null or p_line <> floor(p_line) + 0.5 then raise exception 'Lines must end in .5'; end if;
+  if p_line <= coalesce(b.live_current, 0) then raise exception 'The count has already passed that line'; end if;
+  if p_line > b.line * 4 + 20 then raise exception 'That line is too far from the main line'; end if;
+  return do_wager(p_bet, null, p_side, p_line, p_stake, p_expected_odds);
+end $$;
+
+drop function if exists public.update_live_odds(uuid, numeric, numeric);
+create or replace function public.update_live_count(p_bet uuid, p_current numeric)
+returns public.bets language plpgsql security definer set search_path = public, private as $$
+declare b bets; m record;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then raise exception 'Only the bet''s creator or the group owner can update the count'; end if;
+  if b.line is null then raise exception 'Live counts only work on over/under bets'; end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if b.closes_at is null then raise exception 'Give the bet an end time first so the odds can follow the clock'; end if;
+  if now() < coalesce(b.starts_at, b.created_at) then raise exception 'The event hasn''t started yet'; end if;
+  if p_current is null or p_current < 0 then raise exception 'The count can''t be negative'; end if;
+  select * into m from ou_model(b);
+  update bets set live_current = p_current, live_lambda = m.lam, live_overround = m.ovr, live_updated_at = now(),
+      status = case when p_current > b.line then 'locked' else status end
+    where id = p_bet returning * into b;
+  perform reprice_bet(p_bet);
+  return b;
+end $$;
+revoke execute on function public.update_live_count(uuid, numeric) from public, anon;
+grant execute on function public.update_live_count(uuid, numeric) to authenticated;
+
+drop function public.create_bet(uuid, text, text, numeric, jsonb, uuid[], timestamptz);
+create function public.create_bet(
+  p_group uuid, p_title text, p_detail text, p_line numeric, p_outcomes jsonb,
+  p_hidden uuid[] default '{}', p_closes_at timestamptz default null, p_starts_at timestamptz default null)
+returns uuid language plpgsql security definer set search_path = public, private as $$
+declare
+  b uuid;
+  n int;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  n := jsonb_array_length(coalesce(p_outcomes, '[]'::jsonb));
+  if n < 2 or n > 8 then raise exception 'A bet needs 2 to 8 outcomes'; end if;
+  if p_closes_at is not null and p_closes_at <= now() then raise exception 'Pick an end time in the future'; end if;
+  if p_closes_at is not null and p_closes_at > now() + interval '90 days' then raise exception 'End time can be at most 90 days out'; end if;
+  if p_starts_at is not null and p_starts_at > now() + interval '90 days' then raise exception 'Start time can be at most 90 days out'; end if;
+  if p_starts_at is not null and p_closes_at is not null and p_starts_at >= p_closes_at then
+    raise exception 'The end time has to be after the start time';
+  end if;
+  if auth.uid() = any(coalesce(p_hidden, '{}')) then raise exception 'You can''t hide a bet from yourself'; end if;
+  if exists (select 1 from unnest(coalesce(p_hidden, '{}')) h(uid)
+             where not exists (select 1 from memberships where group_id = p_group and user_id = h.uid)) then
+    raise exception 'You can only hide bets from people in this group';
+  end if;
+  insert into bets (group_id, creator_id, title, detail, line, closes_at, starts_at)
+    values (p_group, auth.uid(), trim(p_title), coalesce(trim(p_detail), ''), p_line, p_closes_at,
+            case when p_starts_at is not null and p_starts_at > now() then p_starts_at end)
+    returning id into b;
+  insert into outcomes (bet_id, group_id, label, odds, open_odds, position)
+    select b, p_group, trim(o ->> 'label'), (o ->> 'odds')::int, (o ->> 'odds')::int, (ord - 1)::int
+    from jsonb_array_elements(p_outcomes) with ordinality as t(o, ord);
+  insert into bet_hidden (bet_id, user_id, group_id)
+    select distinct b, uid, p_group from unnest(coalesce(p_hidden, '{}')) as h(uid);
+  return b;
+end $$;
+revoke execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[], timestamptz, timestamptz) from public, anon;
+grant execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[], timestamptz, timestamptz) to authenticated;
+
+create or replace function public.set_bet_close(p_bet uuid, p_closes_at timestamptz)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then raise exception 'Only the bet''s creator or the group owner can change the end time'; end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if p_closes_at is not null and p_closes_at <= greatest(now(), coalesce(b.starts_at, now())) then
+    raise exception 'Pick an end time after the start time and in the future';
+  end if;
+  update bets set closes_at = p_closes_at where id = p_bet;
+  perform reprice_bet(p_bet);
+end $$;
+
+drop function if exists private.ou_price(public.bets, numeric, text);
+
+create or replace function private.tick()
+returns void language plpgsql security definer set search_path = public, private as $$
+declare r record;
+begin
+  update bets set status = 'locked' where status = 'open' and closes_at is not null and closes_at <= now();
+  for r in select id from bets where status = 'open' loop
+    perform reprice_bet(r.id);
+  end loop;
+end $$;
+revoke execute on function private.tick() from public, anon, authenticated;
+select cron.unschedule('house-line-lock-expired-bets');
+select cron.schedule('house-line-tick', '* * * * *', 'select private.tick()');
