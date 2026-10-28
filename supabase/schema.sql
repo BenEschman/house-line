@@ -340,3 +340,29 @@ grant execute on function public.void_bet(uuid)                              to 
 
 alter publication supabase_realtime
   add table public.bets, public.outcomes, public.wagers, public.memberships;
+
+-------------------------------------------------------------------------------
+-- Hardening (from Supabase's security advisor): keep helpers out of the API
+-------------------------------------------------------------------------------
+
+create schema if not exists private;
+revoke all on schema private from public, anon;
+grant usage on schema private to authenticated;
+
+alter function public.is_member(uuid) set schema private;
+alter function public.shares_group(uuid) set schema private;
+alter function public.can_manage_bet(public.bets) set schema private;
+
+revoke execute on function private.is_member(uuid) from public, anon;
+revoke execute on function private.shares_group(uuid) from public, anon;
+grant execute on function private.is_member(uuid) to authenticated;     -- needed by RLS policies
+grant execute on function private.shares_group(uuid) to authenticated;  -- needed by RLS policies
+revoke execute on function private.can_manage_bet(public.bets) from public, anon, authenticated;
+
+alter function public.create_bet(uuid, text, text, numeric, jsonb) set search_path = public, private;
+alter function public.set_bet_status(uuid, text) set search_path = public, private;
+alter function public.settle_bet(uuid, uuid) set search_path = public, private;
+alter function public.void_bet(uuid) set search_path = public, private;
+
+revoke execute on function public.handle_new_user() from public, anon, authenticated;
+alter function public.american_return(bigint, int) set search_path = public;
