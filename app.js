@@ -53,7 +53,7 @@ async function openGroup(id) {
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
   const [bets, wagers, members] = await Promise.all([
-    sb.from("bets").select("*, outcomes(id, label, odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
+    sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
   ]);
