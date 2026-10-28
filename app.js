@@ -289,6 +289,23 @@ function betCard(b) {
   </article>`;
 }
 
+// Odds input with a ± button: phone number pads have no + or − key.
+function oddsField(id, value, attrs = "") {
+  const neg = String(value).trim().startsWith("-");
+  return `<div class="odds-field">
+    <button type="button" class="sign" data-sign-for="${id}" aria-label="Switch between minus and plus odds">${neg ? "−" : "+"}<small>±</small></button>
+    <input class="inp num" id="${id}" ${attrs} inputmode="numeric" pattern="[0-9]*" autocomplete="off" placeholder="110" value="${esc(String(value).replace(/^[+-]/, ""))}">
+  </div>`;
+}
+// Read an odds field back as a signed string like "-110" or "+150".
+function oddsValue(id) {
+  const input = document.getElementById(id), btn = document.querySelector(`[data-sign-for="${id}"]`);
+  if (!input) return undefined;
+  const digits = input.value.replace(/[^0-9]/g, "");
+  if (!digits) return "";
+  return (btn?.textContent.trim().startsWith("−") ? "-" : "+") + digits;
+}
+
 function createHTML() {
   const d = state.draft, ou = d.type === "ou";
   const typeSeg = `<div class="seg" role="group" aria-label="Bet type">${[["ou", "Over / Under"], ["custom", "Custom outcomes"]]
@@ -296,18 +313,18 @@ function createHTML() {
   const body = ou ? `
     <label class="f" for="c-line">Line<input class="inp num" id="c-line" inputmode="decimal" placeholder="12.5" value="${esc(d.line)}"><span class="hint">Use a .5 so nobody pushes.</span></label>
     <div class="orow two">
-      <label class="f" for="c-over">Over odds<input class="inp num" id="c-over" inputmode="numeric" value="${esc(d.overOdds)}"></label>
-      <label class="f" for="c-under">Under odds<input class="inp num" id="c-under" inputmode="numeric" value="${esc(d.underOdds)}"></label>
+      <label class="f" for="c-over">Over odds${oddsField("c-over", d.overOdds)}</label>
+      <label class="f" for="c-under">Under odds${oddsField("c-under", d.underOdds)}</label>
     </div>` : `
     <div class="f">Outcomes &amp; odds
       <div class="list" style="gap:8px">${d.outcomes.map((o, i) => `
         <div class="orow">
           <input class="inp" id="c-ol-${i}" data-ol="${i}" maxlength="60" placeholder="Outcome ${i + 1}" value="${esc(o.label)}" aria-label="Outcome ${i + 1}">
-          <input class="inp num" id="c-oo-${i}" data-oo="${i}" inputmode="numeric" placeholder="+150" value="${esc(o.odds)}" aria-label="Odds for outcome ${i + 1}">
+          ${oddsField(`c-oo-${i}`, o.odds, `data-oo="${i}" aria-label="Odds for outcome ${i + 1}"`)}
           <button type="button" class="x" data-rm="${i}" aria-label="Remove outcome ${i + 1}" ${d.outcomes.length <= 2 ? "disabled" : ""}>×</button>
         </div>`).join("")}</div>
       <button type="button" class="btn" id="c-add" style="align-self:flex-start;margin-top:4px" ${d.outcomes.length >= 8 ? "disabled" : ""}>+ Add outcome</button>
-      <span class="hint">−150 means risk 150 to win 100. +200 means risk 100 to win 200.</span>
+      <span class="hint">Tap ± to switch minus and plus. −150 means risk 150 to win 100. +200 means risk 100 to win 200.</span>
     </div>`;
   return `<h2>Post a line</h2>${typeSeg}
   <form class="form" id="createForm">
@@ -519,11 +536,13 @@ function openGroups() {
 
 function syncDraft() {
   const d = state.draft, v = id => document.getElementById(id)?.value;
-  for (const [id, key] of [["c-title", "title"], ["c-detail", "detail"], ["c-line", "line"], ["c-over", "overOdds"], ["c-under", "underOdds"]])
+  for (const [id, key] of [["c-title", "title"], ["c-detail", "detail"], ["c-line", "line"]])
     if (v(id) !== undefined) d[key] = v(id);
+  if (oddsValue("c-over") !== undefined) d.overOdds = oddsValue("c-over");
+  if (oddsValue("c-under") !== undefined) d.underOdds = oddsValue("c-under");
   if (document.getElementById("c-at")) d.closesAt = document.getElementById("c-at").value;
   document.querySelectorAll("[data-ol]").forEach(el => d.outcomes[+el.dataset.ol].label = el.value);
-  document.querySelectorAll("[data-oo]").forEach(el => d.outcomes[+el.dataset.oo].odds = el.value);
+  document.querySelectorAll("[data-oo]").forEach(el => d.outcomes[+el.dataset.oo].odds = oddsValue(el.id));
 }
 
 $("#tabs").addEventListener("click", e => {
@@ -541,6 +560,12 @@ document.addEventListener("click", async e => {
   if (t.id === "copyCode") {
     const code = group()?.invite_code || "";
     try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
+    return;
+  }
+  if (t.dataset.signFor) {
+    const neg = t.textContent.trim().startsWith("−");
+    t.innerHTML = `${neg ? "+" : "−"}<small>±</small>`;
+    syncDraft();
     return;
   }
   if (!t.closest("#app")) return;
@@ -615,13 +640,13 @@ document.addEventListener("submit", async e => {
     if (d.type === "ou") {
       const L = Number(d.line), ov = Number(d.overOdds), un = Number(d.underOdds);
       if (!d.line.trim() || !Number.isFinite(L)) return (err.textContent = "Set a number for the line, like 12.5.");
-      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +120).");
+      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds need at least 100 (like −110 or +120). Tap ± to switch minus and plus.");
       line = L;
       outcomes = [{ label: `Over ${L}`, odds: ov }, { label: `Under ${L}`, odds: un }];
     } else {
       outcomes = d.outcomes.map(o => ({ label: o.label.trim(), odds: Number(o.odds) }));
       if (outcomes.some(o => !o.label)) return (err.textContent = "Every outcome needs a name.");
-      if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +250).");
+      if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds need at least 100 (like −110 or +250). Tap ± to switch minus and plus.");
     }
     if (d.closesAt && new Date(d.closesAt) <= new Date()) return (err.textContent = "Pick a closing time in the future.");
     busy(true);

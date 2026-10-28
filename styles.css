@@ -176,3 +176,12 @@ input[type=range]{width:100%;accent-color:var(--felt)}
 .close-chips button{text-transform:none;letter-spacing:0;font-size:14px}
 .close-chips button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
 input[type=datetime-local].inp{min-height:46px}
+
+/* odds field with ± sign toggle (phone keypads have no minus key) */
+.odds-field{display:grid;grid-template-columns:52px 1fr;gap:6px;min-width:0}
+.odds-field .sign{border:1px solid var(--line);background:var(--felt-soft);color:var(--felt);border-radius:10px;
+  font-family:var(--display);font-size:26px;font-weight:700;line-height:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;text-transform:none;letter-spacing:0}
+.odds-field .sign small{font-family:var(--body);font-size:10px;font-weight:600;color:var(--muted)}
+.odds-field .sign:active{transform:scale(.96)}
+.odds-field .inp{min-width:0}
+.orow{grid-template-columns:1fr 132px 36px}
