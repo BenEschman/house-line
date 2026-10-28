@@ -308,16 +308,20 @@ function dayLabel(key) {
   return { rel, date };
 }
 // newestFirst: settled lists read best from most recent back.
+state.dayOpen = {};   // day key -> open/closed, remembered while the app is open
 function dayGroupsHTML(bets, newestFirst = false) {
   const groups = new Map();
   for (const b of [...bets].sort((x, y) => (betStart(x) - betStart(y)) * (newestFirst ? -1 : 1)))
     (groups.get(dayKey(betStart(b))) || groups.set(dayKey(betStart(b)), []).get(dayKey(betStart(b)))).push(b);
-  return [...groups].map(([key, list]) => {
+  const todayKey = dayKey(new Date());
+  return [...groups].map(([key, list], i) => {
     const { rel, date } = dayLabel(key);
-    return `<section class="day">
-      <h3 class="day-head"><span>${rel ? `<b>${rel}</b> · ` : ""}${esc(date)}</span><small>${list.length} ${list.length === 1 ? "bet" : "bets"}</small></h3>
+    // Default: today open; earlier days with still-active bets open; otherwise just the first day.
+    const open = state.dayOpen[key] ?? (key === todayKey || (!newestFirst && key < todayKey) || (i === 0 && !groups.has(todayKey)));
+    return `<details class="day" data-day="${key}" ${open ? "open" : ""}>
+      <summary class="day-head"><span>${rel ? `<b>${rel}</b> · ` : ""}${esc(date)}</span><small>${list.length} ${list.length === 1 ? "bet" : "bets"}</small><i class="chev" aria-hidden="true"></i></summary>
       <div class="list">${list.map(betCard).join("")}</div>
-    </section>`;
+    </details>`;
   }).join("");
 }
 
@@ -479,12 +483,7 @@ function propsHTML() {
     <div class="chips">${chip("data-pf-player", "", "Everyone", !state.propPlayer)}${players.map(id => chip("data-pf-player", id, id === uid() ? "You" : nameOf(id), state.propPlayer === id)).join("")}</div>
   </div>`;
   const shown = stats.filter(sg => !state.propStat || sg.stat.toLowerCase() === state.propStat);
-  const lineMatch = b => { const pr = propOf(b); return pr && (!state.propStat || pr.stat.toLowerCase() === state.propStat) && (!state.propPlayer || pr.player_id === state.propPlayer); };
-  const live = state.bets.filter(b => b.prop_id && (b.status === "open" || b.status === "locked") && lineMatch(b));
-  const lines = live.length
-    ? `<h2 class="sub-head">Lines</h2>${dayGroupsHTML(live)}`
-    : `<div class="empty slim"><b>No prop lines up${state.propStat || state.propPlayer ? " for this filter" : ""}</b>Tap Post lines on a stat below to put some up.</div>`;
-  return head + bar + lines + `<h2 class="sub-head">Stat lines</h2>` + shown.map(sg => {
+  return head + bar + `<p class="hint props-hint">Tap a name to see their line and bet.</p>` + shown.map(sg => {
     const rows = [...sg.props].filter(pr => !state.propPlayer || pr.player_id === state.propPlayer)
       .sort((x, y) => nameOf(x.player_id).localeCompare(nameOf(y.player_id)));
     if (!rows.length) return "";
@@ -500,16 +499,28 @@ function propsHTML() {
   }).join("");
 }
 
+state.openProps = new Set();   // prop ids whose line is expanded
 function propRow(pr) {
-  const hist = propHistory(pr), active = propActive(pr), n = hist.length;
+  const hist = propHistory(pr), active = propActive(pr), n = hist.length, open = state.openProps.has(pr.id);
   const recent = hist.slice(0, 5).map(b => `<span class="res num">${esc(String(Number(b.final_value)))}</span>`).join("");
-  const right = active
-    ? `<button class="prop-live" data-goto-bet="${esc(active.id)}"><span class="num">${esc(String(Number(active.line)))}</span><span class="go">›</span></button>`
-    : n >= AUTO_THRESHOLD ? `<span class="alt-tag">auto</span>` : `<span class="prop-status num">${n}/${AUTO_THRESHOLD}</span>`;
-  return `<div class="stat-row">
-    ${avatarHTML(pr.player_id, 30)}
-    <div class="who"><b>${esc(pr.player_id === uid() ? "You" : nameOf(pr.player_id))}</b>${recent ? `<div class="results">${recent}</div>` : `<span class="prop-status">No results yet</span>`}</div>
-    ${right}
+  let right;
+  if (active) {
+    const [ov, un] = active.outcomes;
+    right = `<span class="row-line"><b class="num">${esc(String(Number(active.line)))}</b><small class="num">O ${fmtOdds(priceOf(active, ov))} · U ${fmtOdds(priceOf(active, un))}</small></span>`;
+  } else {
+    right = n >= AUTO_THRESHOLD ? `<span class="alt-tag">auto</span>` : `<span class="prop-status num">${n}/${AUTO_THRESHOLD}</span>`;
+  }
+  const canPost = pr.player_id !== uid() || n >= AUTO_THRESHOLD;
+  const body = !open ? "" : active
+    ? `<div class="prop-open">${betCard(active)}</div>`
+    : `<div class="prop-open none"><span>No ${esc(pr.stat)} line up for ${esc(pr.player_id === uid() ? "you" : nameOf(pr.player_id))} right now.</span>
+        ${canPost ? `<button class="btn" data-post-stat="${esc(pr.stat)}" data-post-only="${esc(pr.player_id)}">Post a line</button>` : ""}</div>`;
+  return `<div class="prop-item${open ? " open" : ""}">
+    <button class="stat-row" data-toggle-prop="${esc(pr.id)}" aria-expanded="${open}">
+      ${avatarHTML(pr.player_id, 30)}
+      <span class="who"><b>${esc(pr.player_id === uid() ? "You" : nameOf(pr.player_id))}</b>${recent ? `<span class="results">${recent}</span>` : `<span class="prop-status">No results yet</span>`}</span>
+      ${right}<i class="chev" aria-hidden="true"></i>
+    </button>${body}
   </div>`;
 }
 
@@ -1092,11 +1103,13 @@ function goToBet(id) {
   if (b?.prop_id && propOf(b)) {
     state.tab = "props";
     const pr = propOf(b);
+    state.openProps.add(pr.id);
     if (state.propStat && state.propStat !== pr.stat.toLowerCase()) state.propStat = "";
     if (state.propPlayer && state.propPlayer !== pr.player_id) state.propPlayer = "";
   } else {
     state.tab = "board";
     state.filter = !b ? "open" : b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
+    if (b) state.dayOpen[dayKey(betStart(b))] = true;
   }
   render();
   if (b) setTimeout(() => {
@@ -1340,6 +1353,11 @@ document.addEventListener("click", async e => {
   if (t.dataset.pfPlayer !== undefined) { state.propPlayer = t.dataset.pfPlayer; return render(); }
   if (t.dataset.postStat) return openPostSlate(t.dataset.postStat, t.dataset.postOnly || "");
   if (t.dataset.gotoBet) return goToBet(t.dataset.gotoBet);
+  if (t.dataset.toggleProp) {
+    const id = t.dataset.toggleProp;
+    state.openProps.has(id) ? state.openProps.delete(id) : state.openProps.add(id);
+    return render();
+  }
   if (t.dataset.signFor) {
     const neg = t.textContent.trim().startsWith("−");
     t.innerHTML = `${neg ? "+" : "−"}<small>±</small>`;
@@ -1437,6 +1455,15 @@ document.addEventListener("submit", async e => {
     state.tab = "board"; state.filter = "open"; toast("Bet posted"); loadGroupData();
   }
 });
+
+// Record the choice on tap (the toggle event fires a moment later, after any re-render).
+document.addEventListener("click", e => {
+  const sum = e.target.closest?.("details.day > summary");
+  if (sum) state.dayOpen[sum.parentElement.dataset.day] = !sum.parentElement.open;
+});
+document.addEventListener("toggle", e => {
+  if (e.target.matches?.("details.day")) state.dayOpen[e.target.dataset.day] = e.target.open;
+}, true);
 
 /* ---------------- bottom bar ---------------- */
 

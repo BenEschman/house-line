@@ -361,3 +361,29 @@ nav.tabs.away{transform:translateY(calc(100% + 2px))}
 .empty.slim{padding:18px;margin-bottom:12px}
 /* on Props the filter bar is sticky too, so day headers sit below it */
 .prop-filter ~ .day .day-head{position:static;margin-left:0;margin-right:0;padding-left:0;padding-right:0}
+
+/* day dropdowns */
+details.day{margin-bottom:10px}
+details.day > summary{list-style:none;cursor:pointer;-webkit-tap-highlight-color:transparent}
+details.day > summary::-webkit-details-marker{display:none}
+.day-head{align-items:center}
+.day-head span{flex:1;min-width:0}
+.chev{width:9px;height:9px;border-right:2px solid var(--muted);border-bottom:2px solid var(--muted);transform:rotate(-45deg);transition:transform .18s;flex:none;margin:0 4px 2px 6px}
+details.day[open] > summary .chev,.prop-item.open .stat-row .chev{transform:rotate(45deg)}
+details.day:not([open]) > summary{border-bottom:1px solid var(--line)}
+details.day[open] > .list{padding-bottom:6px}
+@media (prefers-reduced-motion:reduce){.chev{transition:none}}
+
+/* props: tap a player to open their line */
+.props-hint{margin:0 0 10px}
+.prop-item{border-bottom:1px solid var(--line)}
+.prop-item:last-child{border-bottom:0}
+.prop-item .stat-row{width:100%;border:0;background:none;text-align:left;cursor:pointer;border-bottom:0}
+.prop-item.open .stat-row{background:var(--felt-soft)}
+.row-line{display:flex;flex-direction:column;align-items:flex-end;line-height:1.1}
+.row-line b{font-family:var(--display);font-size:20px;color:var(--felt)}
+.row-line small{font-size:11px;color:var(--muted);white-space:nowrap}
+.prop-open{padding:10px 12px 14px;background:var(--felt-soft)}
+.prop-open .bet{box-shadow:none}
+.prop-open.none{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:14px;color:var(--muted)}
+.prop-item.open .av.initial{background:var(--paper)}
