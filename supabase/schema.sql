@@ -56,9 +56,8 @@ create table public.outcomes (
   position  int  not null
 );
 
-alter table public.bets
-  add constraint bets_winning_outcome_fk
-  foreign key (winning_outcome_id) references public.outcomes(id);
+-- No FK from bets.winning_outcome_id to outcomes: a second bets<->outcomes link makes
+-- PostgREST embeds ambiguous. settle_bet() validates the winner instead.
 
 create table public.wagers (
   id          uuid primary key default gen_random_uuid(),
