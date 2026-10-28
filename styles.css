@@ -168,3 +168,11 @@ input[type=range]{width:100%;accent-color:var(--felt)}
 .bet p.note svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;flex:none}
 .hide-chips button{text-transform:none;letter-spacing:0;font-size:14px}
 .hide-chips button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink);text-decoration:line-through}
+
+/* closing time */
+.bet p.close-note{color:var(--ink)}
+.bet p.close-note.ticking svg{color:var(--felt)}
+.close-chips{margin-bottom:8px}
+.close-chips button{text-transform:none;letter-spacing:0;font-size:14px}
+.close-chips button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}
+input[type=datetime-local].inp{min-height:46px}

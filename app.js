@@ -6,7 +6,7 @@ const configured = cfg.supabaseUrl && !cfg.supabaseUrl.includes("YOUR-PROJECT") 
 const sb = configured ? window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey) : null;
 
 const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdds: "-110", underOdds: "-110",
-  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [] });
+  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [], closesAt: "" });
 
 const state = {
   session: null, groups: [], groupId: null,
@@ -50,6 +50,35 @@ function liveQuote(b, current, progress) {
   }
   const pOver = poissonAtLeast(Math.floor(Number(b.line) - current) + 1, lambda * (1 - progress));
   return { over: toAmerican(pOver * over), under: toAmerican((1 - pOver) * over), decided: current > Number(b.line) || progress >= 1, pOver };
+}
+// Closing-time helpers. Inputs use the device's local time; the server stores UTC.
+const pad2 = n => String(n).padStart(2, "0");
+const toLocalInput = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}T${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+function nextAtHour(h) { const d = new Date(); d.setHours(h, 0, 0, 0); if (d <= new Date()) d.setDate(d.getDate() + 1); return d; }
+function closePresets() {
+  const inHour = new Date(Date.now() + 3600e3); inHour.setSeconds(0, 0);
+  return [["none", "No limit", ""], ["1h", "In 1 hour", toLocalInput(inHour)], ["mid", "Midnight", toLocalInput(nextAtHour(0))], ["2am", "2 AM", toLocalInput(nextAtHour(2))]];
+}
+function fmtClose(iso) {
+  const d = new Date(iso), soon = Math.abs(d - Date.now()) < 20 * 3600e3;
+  return d.toLocaleString([], soon ? { hour: "numeric", minute: "2-digit" } : { weekday: "short", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+function leftText(iso) {
+  const m = Math.max(0, Math.round((new Date(iso) - Date.now()) / 60000));
+  if (m < 1) return "under a minute left";
+  if (m < 60) return `${m}m left`;
+  const h = Math.floor(m / 60); return h < 48 ? `${h}h ${m % 60}m left` : `${Math.round(h / 24)} days left`;
+}
+const isPast = iso => iso && new Date(iso) <= new Date();
+function clockProgress(b) {
+  if (!b.closes_at) return null;
+  const start = new Date(b.created_at), end = new Date(b.closes_at);
+  return Math.min(1, Math.max(0, (Date.now() - start) / (end - start)));
+}
+function closePicker(prefix, value) {
+  return `<div class="chips close-chips">${closePresets().map(([k, l, v]) =>
+      `<button type="button" data-close-preset="${prefix}" data-v="${v}" aria-pressed="${value === v}">${l}</button>`).join("")}</div>
+    <input class="inp num" type="datetime-local" id="${prefix}-at" value="${esc(value)}" aria-label="Closing date and time">`;
 }
 const agoText = iso => { const m = Math.round((Date.now() - new Date(iso)) / 60000); return m < 1 ? "just now" : m < 60 ? `${m}m ago` : `${Math.round(m / 60)}h ago`; };
 const uid = () => state.session?.user?.id;
@@ -225,7 +254,8 @@ function betCard(b) {
   for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid()) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
   const open = b.status === "open";
   const mine = b.creator_id === uid();
-  const canBet = open && !mine;
+  const closed = isPast(b.closes_at);
+  const canBet = open && !mine && !closed;
   const hiddenFrom = (state.hidden[b.id] || []).map(nameOf);
   const outs = b.outcomes.map(o => {
     const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
@@ -240,6 +270,7 @@ function betCard(b) {
   const live = b.status === "open" || b.status === "locked";
   const ctl = live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
       ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live update</button>` : ""}
+      <button class="btn" data-act="closetime" data-bet="${esc(b.id)}">Close time</button>
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
       <button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button>
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
@@ -248,6 +279,7 @@ function betCard(b) {
       <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
+      ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Betting closed at ${esc(fmtClose(b.closes_at))}` : `Betting closes ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
       ${mine && open ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
       ${b.live_updated_at ? `<div class="livebar"><span class="dot${live ? "" : " off"}"></span><b class="num">${esc(String(Number(b.live_current)))}</b>&nbsp;so far · <span class="num">${Math.round(Number(b.live_progress) * 100)}%</span>&nbsp;through<span class="when">${agoText(b.live_updated_at)}</span>
@@ -282,6 +314,7 @@ function createHTML() {
     <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
     <label class="f" for="c-detail">Details (optional)<input class="inp" id="c-detail" maxlength="240" placeholder="Settled by stopwatch at the table" value="${esc(d.detail)}"></label>
     ${body}
+    <div class="f">Betting closes${closePicker("c", state.draft.closesAt)}<span class="hint">Your local time. Wagers stop automatically at this time.</span></div>
     ${hidePicker()}
     <div class="err" id="c-err"></div>
     <button class="btn primary big" type="submit">Post bet</button>
@@ -374,6 +407,8 @@ function openLive(betId) {
   const b = betById(betId); if (!b) return;
   const line = Number(b.line);
   let cur = Number(b.live_current ?? 0), prog = Math.round(Number(b.live_progress ?? 0) * 100);
+  const clock = clockProgress(b);
+  if (clock != null) prog = Math.round(clock * 20) * 5;
   sheet(`<h4>Live update: ${esc(b.title)}</h4>
     <div class="f">Count so far · line ${esc(b.line)}
       <div class="stepper"><button type="button" id="l-minus" aria-label="Decrease count">−</button>
@@ -381,6 +416,7 @@ function openLive(betId) {
         <button type="button" id="l-plus" aria-label="Increase count">+</button></div></div>
     <label class="f" for="l-prog">How far through the event · <span class="num" id="l-prog-v">${prog}%</span>
       <input type="range" id="l-prog" min="0" max="100" step="5" value="${prog}"></label>
+    ${clock != null ? `<span class="hint">Set from the clock: ${Math.round(clock * 100)}% of the way from when you posted it to ${esc(fmtClose(b.closes_at))}. Adjust if the event started later.</span>` : ""}
     <div class="quote">
       <div><small>${esc(b.outcomes[0].label)}</small><b class="num" id="q-over"></b><span class="num" id="q-over-was"></span></div>
       <div><small>${esc(b.outcomes[1].label)}</small><b class="num" id="q-under"></b><span class="num" id="q-under-was"></span></div>
@@ -412,6 +448,30 @@ function openLive(betId) {
     if (error) { $("#l-err").textContent = errMsg(error); $("#l-save").disabled = false; return; }
     closeSheet();
     toast(data?.status === "locked" && b.status === "open" ? "Odds updated. The bet is decided, so it's locked. Settle it when ready." : "Live odds updated");
+    loadGroupData();
+  };
+}
+
+function openCloseTime(betId) {
+  const b = betById(betId); if (!b) return;
+  const cur = b.closes_at ? toLocalInput(new Date(b.closes_at)) : "";
+  sheet(`<h4>Closing time: ${esc(b.title)}</h4>
+    <div class="f">Betting closes${closePicker("t", cur)}<span class="hint">Your local time. Clear it for no limit.</span></div>
+    <div class="err" id="t-err"></div>
+    <button class="btn primary big" id="t-save">Save closing time</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  document.querySelectorAll('[data-close-preset="t"]').forEach(btn => btn.onclick = () => {
+    $("#t-at").value = btn.dataset.v;
+    document.querySelectorAll('[data-close-preset="t"]').forEach(x => x.setAttribute("aria-pressed", String(x === btn)));
+  });
+  $("#t-save").onclick = async () => {
+    const v = $("#t-at").value;
+    if (v && new Date(v) <= new Date()) return ($("#t-err").textContent = "Pick a closing time in the future.");
+    $("#t-save").disabled = true;
+    const { error } = await sb.rpc("set_bet_close", { p_bet: betId, p_closes_at: v ? new Date(v).toISOString() : null });
+    if (error) { $("#t-err").textContent = errMsg(error); $("#t-save").disabled = false; return; }
+    closeSheet();
+    toast(v ? `Betting now closes ${fmtClose(new Date(v).toISOString())}${b.status === "locked" ? ". Tap Reopen to take wagers again." : ""}` : "Closing time removed");
     loadGroupData();
   };
 }
@@ -461,6 +521,7 @@ function syncDraft() {
   const d = state.draft, v = id => document.getElementById(id)?.value;
   for (const [id, key] of [["c-title", "title"], ["c-detail", "detail"], ["c-line", "line"], ["c-over", "overOdds"], ["c-under", "underOdds"]])
     if (v(id) !== undefined) d[key] = v(id);
+  if (document.getElementById("c-at")) d.closesAt = document.getElementById("c-at").value;
   document.querySelectorAll("[data-ol]").forEach(el => d.outcomes[+el.dataset.ol].label = el.value);
   document.querySelectorAll("[data-oo]").forEach(el => d.outcomes[+el.dataset.oo].odds = el.value);
 }
@@ -484,6 +545,7 @@ document.addEventListener("click", async e => {
   }
   if (!t.closest("#app")) return;
   if (t.dataset.filter) { state.filter = t.dataset.filter; return render(); }
+  if (t.dataset.closePreset === "c") { syncDraft(); state.draft.closesAt = t.dataset.v; return render(); }
   if (t.dataset.hide) {
     syncDraft();
     const h = state.draft.hidden, id = t.dataset.hide;
@@ -496,6 +558,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.out && !t.disabled) return openWager(t.dataset.bet, t.dataset.out);
   if (t.dataset.act === "settle") return openSettle(t.dataset.bet);
   if (t.dataset.act === "live") return openLive(t.dataset.bet);
+  if (t.dataset.act === "closetime") return openCloseTime(t.dataset.bet);
   if (t.dataset.act === "void") return openVoid(t.dataset.bet);
   if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
     const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });
@@ -560,8 +623,9 @@ document.addEventListener("submit", async e => {
       if (outcomes.some(o => !o.label)) return (err.textContent = "Every outcome needs a name.");
       if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +250).");
     }
+    if (d.closesAt && new Date(d.closesAt) <= new Date()) return (err.textContent = "Pick a closing time in the future.");
     busy(true);
-    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden });
+    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden, p_closes_at: d.closesAt ? new Date(d.closesAt).toISOString() : null });
     busy(false);
     if (error) return (err.textContent = errMsg(error));
     state.draft = { ...blankDraft(), type: d.type };
@@ -570,6 +634,11 @@ document.addEventListener("submit", async e => {
 });
 
 /* ---------------- boot ---------------- */
+
+// Keep countdowns current, and disable betting the moment a bet's time passes.
+setInterval(() => {
+  if (state.tab === "board" && !$("#sheetHost").children.length && state.bets.some(b => b.closes_at && b.status === "open")) render();
+}, 30000);
 
 render();
 if (sb) {

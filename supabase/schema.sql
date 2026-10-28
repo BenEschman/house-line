@@ -636,3 +636,110 @@ $$;
 revoke execute on function private.can_manage_bet(public.bets) from public, anon, authenticated;
 
 alter publication supabase_realtime add table public.bet_hidden;
+
+-------------------------------------------------------------------------------
+-- Closing time: wagers stop at closes_at; a cron job flips expired bets to locked.
+-------------------------------------------------------------------------------
+
+alter table public.bets add column closes_at timestamptz;
+
+drop function public.create_bet(uuid, text, text, numeric, jsonb, uuid[]);
+create function public.create_bet(
+  p_group uuid, p_title text, p_detail text, p_line numeric, p_outcomes jsonb,
+  p_hidden uuid[] default '{}', p_closes_at timestamptz default null)
+returns uuid language plpgsql security definer set search_path = public, private as $$
+declare
+  b uuid;
+  n int;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  n := jsonb_array_length(coalesce(p_outcomes, '[]'::jsonb));
+  if n < 2 or n > 8 then raise exception 'A bet needs 2 to 8 outcomes'; end if;
+  if p_closes_at is not null and p_closes_at <= now() then raise exception 'Pick a closing time in the future'; end if;
+  if p_closes_at is not null and p_closes_at > now() + interval '90 days' then raise exception 'Closing time can be at most 90 days out'; end if;
+  if auth.uid() = any(coalesce(p_hidden, '{}')) then raise exception 'You can''t hide a bet from yourself'; end if;
+  if exists (select 1 from unnest(coalesce(p_hidden, '{}')) h(uid)
+             where not exists (select 1 from memberships where group_id = p_group and user_id = h.uid)) then
+    raise exception 'You can only hide bets from people in this group';
+  end if;
+  insert into bets (group_id, creator_id, title, detail, line, closes_at)
+    values (p_group, auth.uid(), trim(p_title), coalesce(trim(p_detail), ''), p_line, p_closes_at)
+    returning id into b;
+  insert into outcomes (bet_id, group_id, label, odds, open_odds, position)
+    select b, p_group, trim(o ->> 'label'), (o ->> 'odds')::int, (o ->> 'odds')::int, (ord - 1)::int
+    from jsonb_array_elements(p_outcomes) with ordinality as t(o, ord);
+  insert into bet_hidden (bet_id, user_id, group_id)
+    select distinct b, uid, p_group from unnest(coalesce(p_hidden, '{}')) as h(uid);
+  return b;
+end $$;
+revoke execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[], timestamptz) from public, anon;
+grant execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[], timestamptz) to authenticated;
+
+create or replace function public.set_bet_close(p_bet uuid, p_closes_at timestamptz)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then raise exception 'Only the bet''s creator or the group owner can change the closing time'; end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if p_closes_at is not null and p_closes_at <= now() then raise exception 'Pick a closing time in the future'; end if;
+  update bets set closes_at = p_closes_at where id = p_bet;
+end $$;
+revoke execute on function public.set_bet_close(uuid, timestamptz) from public, anon;
+grant execute on function public.set_bet_close(uuid, timestamptz) to authenticated;
+
+create or replace function public.place_wager(p_outcome uuid, p_stake int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare
+  o outcomes;
+  b bets;
+  m memberships;
+  w wagers;
+begin
+  select * into o from outcomes where id = p_outcome;
+  if not found or hidden_from_me(o.bet_id) then raise exception 'That outcome no longer exists'; end if;
+  select * into b from bets where id = o.bet_id for share;
+  if b.creator_id = auth.uid() then raise exception 'You can''t bet on your own line'; end if;
+  if b.closes_at is not null and now() >= b.closes_at then raise exception 'Betting on this closed'; end if;
+  if b.status <> 'open' then raise exception 'This bet is closed to new wagers'; end if;
+  if p_stake is null or p_stake < 1 then raise exception 'Stake must be at least 1 token'; end if;
+  select * into m from memberships
+    where group_id = b.group_id and user_id = auth.uid() for update;
+  if not found then raise exception 'You are not in this group'; end if;
+  if m.balance < p_stake then
+    raise exception 'Not enough tokens: you have %', m.balance;
+  end if;
+  update memberships set balance = balance - p_stake
+    where group_id = b.group_id and user_id = auth.uid();
+  insert into wagers (group_id, bet_id, outcome_id, user_id, stake, odds)
+    values (b.group_id, b.id, o.id, auth.uid(), p_stake, o.odds)
+    returning * into w;
+  return w;
+end $$;
+
+create or replace function public.set_bet_status(p_bet uuid, p_status text)
+returns void language plpgsql security definer set search_path = public, private as $$
+declare b bets;
+begin
+  select * into b from bets where id = p_bet for update;
+  if not found then raise exception 'Bet not found'; end if;
+  if not can_manage_bet(b) then
+    raise exception 'Only the bet''s creator or the group owner can do that';
+  end if;
+  if p_status not in ('open', 'locked') then raise exception 'Use settle_bet or void_bet to finish a bet'; end if;
+  if b.status not in ('open', 'locked') then raise exception 'This bet is already final'; end if;
+  if p_status = 'open' and b.closes_at is not null and b.closes_at <= now() then
+    raise exception 'This bet''s closing time has passed. Move the closing time later to reopen it.';
+  end if;
+  update bets set status = p_status where id = p_bet;
+end $$;
+
+-- Requires the pg_cron extension (available on Supabase).
+create extension if not exists pg_cron;
+create or replace function private.lock_expired_bets()
+returns void language sql security definer set search_path = public as $$
+  update bets set status = 'locked' where status = 'open' and closes_at is not null and closes_at <= now();
+$$;
+revoke execute on function private.lock_expired_bets() from public, anon, authenticated;
+select cron.schedule('house-line-lock-expired-bets', '* * * * *', 'select private.lock_expired_bets()');
