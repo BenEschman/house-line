@@ -236,6 +236,7 @@ function render() {
   const app = $("#app");
   const inGroup = !!(state.session && state.groupId);
   $("#top").hidden = !inGroup; $("#tabs").hidden = !inGroup;
+  if (inGroup) document.documentElement.style.setProperty("--nav-h", $("#tabs").offsetHeight + "px");
   app.classList.toggle("solo", !inGroup);
   if (!configured) { app.innerHTML = setupHTML(); return; }
   if (!state.session) { app.innerHTML = authHTML(); return; }
@@ -1395,6 +1396,29 @@ document.addEventListener("submit", async e => {
     state.tab = "board"; state.filter = "open"; toast("Bet posted"); loadGroupData();
   }
 });
+
+/* ---------------- bottom bar ---------------- */
+
+// Pad the page by the bar's real height (it varies with the iPhone home-indicator area and text size).
+(() => {
+  const nav = $("#tabs"); if (!nav) return;
+  const setH = () => { if (!nav.hidden) document.documentElement.style.setProperty("--nav-h", nav.offsetHeight + "px"); };
+  try { new ResizeObserver(setH).observe(nav); } catch { window.addEventListener("resize", setH); }
+  setH();
+  // Slide the bar away while scrolling down; bring it back on scroll up or at the very bottom.
+  let lastY = window.scrollY, ticking = false;
+  window.addEventListener("scroll", () => {
+    if (ticking) return; ticking = true;
+    requestAnimationFrame(() => {
+      const y = window.scrollY, atBottom = y + innerHeight >= document.documentElement.scrollHeight - 4;
+      if (y < 60 || atBottom || y < lastY - 6) nav.classList.remove("away");
+      else if (y > lastY + 6) nav.classList.add("away");
+      lastY = y; ticking = false;
+    });
+  }, { passive: true });
+  // Any tab change shows the bar again.
+  nav.addEventListener("click", () => nav.classList.remove("away"));
+})();
 
 /* ---------------- boot ---------------- */
 
