@@ -593,7 +593,7 @@ function leadersHTML() {
   const g = group();
   const rows = [...state.members].sort((a, b) => b.balance - a.balance);
   const invite = (g && g.owner_id === uid() ? `<button class="btn settings-link" id="openSettings">⚙ Group settings</button>` : "") + (g ? `<div class="invite"><div><small>Invite code</small><b>${esc(g.invite_code)}</b></div>
-    <button class="btn" id="copyCode">Copy</button></div>` : "";
+    <button class="btn" id="copyCode">Copy</button></div>` : "");
   return `<h2>Leaderboard</h2>${invite}<div class="list">${rows.map((r, i) => {
     const rec = recordOf(r.id);
     return `<div class="row"><div class="rank num">${i + 1}</div><div class="initial">${esc((r.username[0] || "?").toUpperCase())}</div>
