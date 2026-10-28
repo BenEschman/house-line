@@ -245,3 +245,11 @@ nav.tabs button{font-size:10.5px}
 .manual-inputs .odds-field{grid-template-columns:40px 1fr}
 .manual-inputs .odds-field .sign{font-size:20px}
 @media (max-width:380px){.manual-inputs{grid-template-columns:1fr 1fr}.manual-inputs label:first-child{grid-column:1/-1}}
+
+/* props filter bar */
+.prop-filter{position:sticky;top:calc(env(safe-area-inset-top,0px) + 66px);z-index:4;background:var(--bg);margin:0 calc(-1 * var(--gutter-r)) 14px calc(-1 * var(--gutter-l));
+  padding:8px var(--gutter-r) 10px var(--gutter-l);border-bottom:1px solid var(--line);display:flex;flex-direction:column;gap:6px}
+.prop-filter .chips{flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;padding-bottom:2px}
+.prop-filter .chips::-webkit-scrollbar{display:none}
+.prop-filter button{white-space:nowrap;border:1px solid var(--line);background:var(--paper);border-radius:999px;padding:6px 12px;font-weight:600;font-size:13px;flex:none}
+.prop-filter button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink)}

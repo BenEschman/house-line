@@ -10,7 +10,7 @@ const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdd
 
 const state = {
   session: null, groups: [], groupId: null,
-  bets: [], wagers: [], members: [], hidden: {}, props: [], loaded: false,
+  bets: [], wagers: [], members: [], hidden: {}, props: [], propStat: "", propPlayer: "", loaded: false,
   tab: "board", filter: "open", authMode: "signin", draft: blankDraft(), channel: null,
 };
 
@@ -430,14 +430,26 @@ function propsHTML() {
   if (!state.loaded) return head + `<div class="empty"><b>Loading…</b></div>`;
   const stats = statGroups();
   if (!stats.length) return head + `<div class="empty"><b>No stat lines yet</b>Add one, like Drinks or Shots, and everyone in the group gets a line for it. Set the first ${AUTO_THRESHOLD} lines yourself. After that, each player's line sets itself from their results.</div>`;
-  return head + stats.map(sg => {
-    const rows = [...sg.props].sort((x, y) => nameOf(x.player_id).localeCompare(nameOf(y.player_id)));
+  // Sticky filter bar: jump straight to a stat and/or a player.
+  if (state.propStat && !stats.some(sg => sg.stat.toLowerCase() === state.propStat)) state.propStat = "";
+  const players = [...new Set(state.props.map(p => p.player_id))].sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
+  if (state.propPlayer && !players.includes(state.propPlayer)) state.propPlayer = "";
+  const chip = (attr, val, label, on) => `<button type="button" ${attr}="${esc(val)}" aria-pressed="${on}">${esc(label)}</button>`;
+  const bar = `<div class="prop-filter">
+    <div class="chips">${chip("data-pf-stat", "", "All stats", !state.propStat)}${stats.map(sg => chip("data-pf-stat", sg.stat.toLowerCase(), sg.stat, state.propStat === sg.stat.toLowerCase())).join("")}</div>
+    <div class="chips">${chip("data-pf-player", "", "Everyone", !state.propPlayer)}${players.map(id => chip("data-pf-player", id, id === uid() ? "You" : nameOf(id), state.propPlayer === id)).join("")}</div>
+  </div>`;
+  const shown = stats.filter(sg => !state.propStat || sg.stat.toLowerCase() === state.propStat);
+  return head + bar + shown.map(sg => {
+    const rows = [...sg.props].filter(pr => !state.propPlayer || pr.player_id === state.propPlayer)
+      .sort((x, y) => nameOf(x.player_id).localeCompare(nameOf(y.player_id)));
+    if (!rows.length) return "";
     const autoCount = rows.filter(pr => propHistory(pr).length >= AUTO_THRESHOLD).length;
     const openSlots = rows.filter(pr => !propActive(pr)).length;
     return `<section class="stat-block">
       <div class="stat-head">
         <div><h3>${esc(sg.stat)}</h3><span class="prop-status">${rows.length} players · ${autoCount} auto · ${rows.length - autoCount} set by hand</span></div>
-        <button class="btn primary" data-post-stat="${esc(sg.stat)}" ${openSlots ? "" : "disabled"}>${openSlots ? "Post lines" : "All lines up"}</button>
+        <button class="btn primary" data-post-stat="${esc(sg.stat)}" data-post-only="${esc(state.propPlayer)}" ${openSlots ? "" : "disabled"}>${openSlots ? "Post lines" : "All lines up"}</button>
       </div>
       <div class="stat-rows">${rows.map(propRow).join("")}</div>
     </section>`;
@@ -489,7 +501,7 @@ function wireSheetTimePickers() {
   });
 }
 
-async function openPostSlate(stat) {
+async function openPostSlate(stat, onlyPlayer = "") {
   const { data: slate, error } = await sb.rpc("prop_slate", { p_group: state.groupId, p_stat: stat });
   if (error) return toast(errMsg(error));
   const others = state.members.filter(m => m.id !== uid()).sort((a, b) => a.username.localeCompare(b.username));
@@ -498,11 +510,12 @@ async function openPostSlate(stat) {
     const name = r.player_id === uid() ? "You" : r.username, sug = r.suggestion;
     if (r.active_bet) return `<div class="slate-row off"><b>${esc(name)}</b><span class="prop-status">Line already up</span></div>`;
     if (!sug.auto && r.player_id === uid()) return `<div class="slate-row off"><b>You</b><span class="prop-status">Someone else sets your line until it's auto (${sug.results}/${sug.needed})</span></div>`;
-    include.add(r.prop_id);
-    const toggle = `<button type="button" class="incl" data-incl="${esc(r.prop_id)}" aria-pressed="true" aria-label="Include ${esc(name)}">✓</button>`;
-    if (sug.auto) return `<div class="slate-row auto" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}</b>
+    const on = !onlyPlayer || r.player_id === onlyPlayer;
+    if (on) include.add(r.prop_id);
+    const toggle = `<button type="button" class="incl" data-incl="${esc(r.prop_id)}" aria-pressed="${on}" aria-label="Include ${esc(name)}">✓</button>`;
+    if (sug.auto) return `<div class="slate-row auto${on ? "" : " skipped"}" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}</b>
       <div class="auto-mini"><span class="alt-tag">auto</span><b class="num">${esc(String(sug.line))}</b><span class="num">O ${fmtOdds(sug.over_odds)} · U ${fmtOdds(sug.under_odds)}</span></div></div>`;
-    return `<div class="slate-row manual" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}<small class="prop-status"> ${sug.results}/${sug.needed} results</small></b>
+    return `<div class="slate-row manual${on ? "" : " skipped"}" data-row="${esc(r.prop_id)}">${toggle}<b>${esc(name)}<small class="prop-status"> ${sug.results}/${sug.needed} results</small></b>
       <div class="manual-inputs">
         <label class="f" for="sl-line-${esc(r.prop_id)}">Line<input class="inp num" id="sl-line-${esc(r.prop_id)}" inputmode="decimal" placeholder="3.5"></label>
         <label class="f" for="sl-over-${esc(r.prop_id)}">Over${oddsField(`sl-over-${r.prop_id}`, "-110")}</label>
@@ -837,7 +850,9 @@ document.addEventListener("click", async e => {
     return;
   }
   if (t.id === "newStat") return openNewStat();
-  if (t.dataset.postStat) return openPostSlate(t.dataset.postStat);
+  if (t.dataset.pfStat !== undefined) { state.propStat = t.dataset.pfStat; return render(); }
+  if (t.dataset.pfPlayer !== undefined) { state.propPlayer = t.dataset.pfPlayer; return render(); }
+  if (t.dataset.postStat) return openPostSlate(t.dataset.postStat, t.dataset.postOnly || "");
   if (t.dataset.gotoBet) {
     const b = betById(t.dataset.gotoBet);
     state.tab = "board"; state.filter = b?.status === "locked" ? "locked" : "open"; render();
