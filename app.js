@@ -10,7 +10,7 @@ const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdd
 
 const state = {
   session: null, groups: [], groupId: null,
-  bets: [], wagers: [], members: [], hidden: {}, loaded: false,
+  bets: [], wagers: [], members: [], hidden: {}, props: [], loaded: false,
   tab: "board", filter: "open", authMode: "signin", draft: blankDraft(), channel: null,
 };
 
@@ -160,11 +160,12 @@ async function openGroup(id) {
 
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
-  const [bets, wagers, members, hidden] = await Promise.all([
+  const [bets, wagers, members, hidden, props] = await Promise.all([
     sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
     sb.from("bet_hidden").select("bet_id, user_id").eq("group_id", gid),
+    sb.from("props").select("*").eq("group_id", gid).order("created_at"),
   ]);
   if (gid !== state.groupId) return;
   const err = bets.error || wagers.error || members.error;
@@ -172,6 +173,7 @@ async function loadGroupData() {
   state.bets = (bets.data || []).map(b => ({ ...b, outcomes: (b.outcomes || []).sort((x, y) => x.position - y.position) }));
   state.wagers = wagers.data || [];
   state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player" }));
+  state.props = props.data || [];
   state.hidden = {};
   for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
   state.loaded = true;
@@ -184,7 +186,7 @@ function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(
 function subscribe(gid) {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel("group-" + gid);
-  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden"])
+  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props"])
     ch.on("postgres_changes", { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
   ch.subscribe();
   state.channel = ch;
@@ -197,7 +199,8 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && st
 const me = () => state.members.find(m => m.id === uid());
 const nameOf = id => id === uid() ? "You" : (state.members.find(m => m.id === id)?.username || "player");
 const betById = id => state.bets.find(b => b.id === id);
-const canManage = b => b.creator_id === uid() || group()?.owner_id === uid();
+const propOf = b => b.prop_id ? state.props.find(p => p.id === b.prop_id) : null;
+const canManage = b => propOf(b)?.player_id !== uid() && (b.creator_id === uid() || group()?.owner_id === uid());
 
 function myStats() {
   let risk = 0, won = 0, lost = 0;
@@ -231,7 +234,7 @@ function render() {
   $("#groupName").textContent = group()?.name || "";
   $("#bal").textContent = state.loaded ? fmtTok(myStats().bal) : "—";
   document.querySelectorAll("nav.tabs button").forEach(b => b.setAttribute("aria-current", String(b.dataset.tab === state.tab)));
-  app.innerHTML = { board: boardHTML, create: createHTML, slip: slipHTML, leaders: leadersHTML }[state.tab]();
+  app.innerHTML = { board: boardHTML, create: createHTML, props: propsHTML, slip: slipHTML, leaders: leadersHTML }[state.tab]();
 }
 
 function setupHTML() {
@@ -301,8 +304,9 @@ function betCard(b) {
   for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid()) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
   const open = b.status === "open";
   const mine = b.creator_id === uid();
+  const prop = propOf(b), myProp = prop?.player_id === uid();
   const closed = isPast(b.closes_at);
-  const canBet = open && !mine && !closed;
+  const canBet = open && !(mine && !b.auto_line) && !myProp && !closed;
   const hiddenFrom = (state.hidden[b.id] || []).map(nameOf);
   const outs = b.outcomes.map(o => {
     const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
@@ -321,15 +325,17 @@ function betCard(b) {
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
       <button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button>
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
-  return `<article class="bet">
+  return `<article class="bet" data-bet-card="${esc(b.id)}">
     <div class="bet-head">
       <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
-      ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Betting closed at ${esc(fmtClose(b.closes_at))}` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
+      ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Ended ${esc(fmtClose(b.closes_at))} · waiting for ${esc(b.creator_id === uid() ? "you" : nameOf(b.creator_id))} to settle` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
       ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
       ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
-      ${mine && open ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
+      ${prop ? `<p class="note prop-note"><span class="prop-tag">PROP</span>${esc(nameOf(prop.player_id))} · ${esc(prop.stat)}${b.auto_line ? ` <span class="alt-tag">auto line</span>` : ""}</p>` : ""}
+      ${myProp && open ? `<p class="note">This prop is about you, so you can't bet on it.</p>` : ""}
+      ${mine && open && !b.auto_line && !myProp ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
       ${liveBar(b, live)}
     </div>
@@ -403,6 +409,145 @@ function hidePicker() {
     <div class="chips hide-chips">${others.map(m => `<button type="button" data-hide="${esc(m.id)}" aria-pressed="${h.includes(m.id)}">${esc(m.username)}</button>`).join("")}</div>
     <span class="hint">${h.length ? `${h.length} ${h.length === 1 ? "person" : "people"} won’t see this bet, its odds, or who bet on it.` : "Pick anyone who shouldn’t see this bet."}</span>
   </div>`;
+}
+
+/* ---------------- player props ---------------- */
+
+const AUTO_THRESHOLD = 3;   // settled results before lines set themselves (matches private.prop_auto_threshold)
+function propHistory(pr) {
+  return state.bets.filter(b => b.prop_id === pr.id && b.status === "settled" && b.final_value != null)
+    .sort((a, b) => (b.settled_at || "").localeCompare(a.settled_at || ""));
+}
+const propActive = pr => state.bets.find(b => b.prop_id === pr.id && (b.status === "open" || b.status === "locked"));
+
+function propsHTML() {
+  const byPlayer = {};
+  for (const pr of state.props) (byPlayer[pr.player_id] ||= []).push(pr);
+  const players = Object.keys(byPlayer).sort((a, b) => nameOf(a).localeCompare(nameOf(b)));
+  const head = `<div class="props-head"><h2>Player props</h2><button class="btn primary" id="newProp">New prop</button></div>`;
+  if (!state.loaded) return head + `<div class="empty"><b>Loading…</b></div>`;
+  if (!players.length) return head + `<div class="empty"><b>No props yet</b>Make one for anyone in the group, like “Jake · Drinks”. Set the first ${AUTO_THRESHOLD} lines yourself. After that, the app sets the line from past results.</div>`;
+  return head + players.map(pid => `
+    <section class="player">
+      <h3 class="player-name"><span class="initial">${esc((nameOf(pid)[0] || "?").toUpperCase())}</span>${esc(pid === uid() ? "You" : nameOf(pid))}</h3>
+      <div class="list">${byPlayer[pid].map(propCard).join("")}</div>
+    </section>`).join("");
+}
+
+function propCard(pr) {
+  const hist = propHistory(pr), active = propActive(pr), mineProp = pr.player_id === uid();
+  const n = hist.length, auto = n >= AUTO_THRESHOLD;
+  const recent = hist.slice(0, 8).map(b => `<span class="res num">${esc(String(Number(b.final_value)))}</span>`).join("");
+  const status = auto
+    ? `<span class="alt-tag">auto lines</span> Set from the last ${Math.min(n, 10)} results`
+    : `Lines set by hand · ${n} of ${AUTO_THRESHOLD} results until auto lines`;
+  let action;
+  if (active) {
+    const ov = active.outcomes[0], un = active.outcomes[1];
+    action = `<button class="prop-live" data-goto-bet="${esc(active.id)}"><span class="pill ${esc(active.status)}">${esc(active.status)}</span>
+      Line ${esc(String(Number(active.line)))} · O ${fmtOdds(priceOf(active, ov))} / U ${fmtOdds(priceOf(active, un))}<span class="go">View ›</span></button>`;
+  } else if (mineProp) {
+    action = `<p class="hint">This prop is about you. Someone else posts its lines.</p>`;
+  } else {
+    action = `<button class="btn primary" data-post-prop="${esc(pr.id)}">Post ${auto ? "auto " : ""}line</button>`;
+  }
+  return `<article class="prop card-ish">
+    <div class="prop-top"><b>${esc(pr.stat)}</b><span class="prop-status">${status}</span></div>
+    ${recent ? `<div class="results"><small>Recent</small>${recent}</div>` : ""}
+    ${action}
+  </article>`;
+}
+
+function openNewProp() {
+  const people = [...state.members].sort((a, b) => a.username.localeCompare(b.username));
+  let player = null;
+  sheet(`<h4>New player prop</h4>
+    <div class="f">Who's it about?<div class="chips hide-chips" id="np-people">${people.map(m =>
+      `<button type="button" data-np-player="${esc(m.id)}" aria-pressed="false">${esc(m.id === uid() ? m.username + " (you)" : m.username)}</button>`).join("")}</div></div>
+    <label class="f" for="np-stat">Stat<input class="inp" id="np-stat" maxlength="40" placeholder="Drinks"></label>
+    <div class="chips close-chips">${["Drinks", "Shots", "Minutes late", "Points", "Texts sent"].map(x => `<button type="button" data-np-stat="${x}">${x}</button>`).join("")}</div>
+    <span class="hint">Pick something you can count. The first ${AUTO_THRESHOLD} lines are set by hand, then the app takes over.</span>
+    <div class="err" id="np-err"></div>
+    <button class="btn primary big" id="np-save">Create prop</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  document.querySelectorAll("[data-np-player]").forEach(btn => btn.onclick = () => {
+    player = btn.dataset.npPlayer;
+    document.querySelectorAll("[data-np-player]").forEach(x => x.setAttribute("aria-pressed", String(x === btn)));
+  });
+  document.querySelectorAll("[data-np-stat]").forEach(btn => btn.onclick = () => { $("#np-stat").value = btn.dataset.npStat; });
+  $("#np-save").onclick = async () => {
+    const stat = $("#np-stat").value.trim();
+    if (!player) return ($("#np-err").textContent = "Pick who the prop is about.");
+    if (!stat) return ($("#np-err").textContent = "Name the stat, like Drinks.");
+    $("#np-save").disabled = true;
+    const { error } = await sb.rpc("create_prop", { p_group: state.groupId, p_player: player, p_stat: stat });
+    if (error) { $("#np-err").textContent = errMsg(error); $("#np-save").disabled = false; return; }
+    closeSheet(); toast(`Prop created: ${nameOf(player)} · ${stat}`); loadGroupData();
+  };
+}
+
+// Small time pickers that live inside a sheet (the form versions re-render the page).
+function sheetTimePicker(id, presets, value, label) {
+  return `<div class="chips close-chips">${presets.map(([k, l, v]) =>
+      `<button type="button" data-sheet-time="${id}" data-v="${v}" aria-pressed="${value === v}">${l}</button>`).join("")}</div>
+    <input class="inp num" type="datetime-local" id="${id}" value="${esc(value)}" aria-label="${label}">`;
+}
+function wireSheetTimePickers() {
+  document.querySelectorAll("[data-sheet-time]").forEach(btn => btn.onclick = () => {
+    $("#" + btn.dataset.sheetTime).value = btn.dataset.v;
+    document.querySelectorAll(`[data-sheet-time="${btn.dataset.sheetTime}"]`).forEach(x => x.setAttribute("aria-pressed", String(x === btn)));
+  });
+}
+
+async function openPostProp(propId) {
+  const pr = state.props.find(p => p.id === propId); if (!pr) return;
+  const { data: sug, error } = await sb.rpc("prop_suggestion", { p_prop: propId });
+  if (error) return toast(errMsg(error));
+  const others = state.members.filter(m => m.id !== uid()).sort((a, b) => a.username.localeCompare(b.username));
+  const hidden = new Set();
+  const lineBlock = sug.auto
+    ? `<div class="auto-line"><small>Line set automatically</small>
+        <b class="num">${esc(String(sug.line))}</b>
+        <span class="num">Over ${fmtOdds(sug.over_odds)} · Under ${fmtOdds(sug.under_odds)}</span>
+        <span class="hint">From ${nameOf(pr.player_id)}'s last ${sug.results} results (weighted average ${sug.mean}). Recent nights count more.</span></div>`
+    : `<label class="f" for="pp-line">Line<input class="inp num" id="pp-line" inputmode="decimal" placeholder="3.5"><span class="hint">${sug.results} of ${sug.needed} results so far. After ${sug.needed}, lines set themselves.</span></label>
+       <div class="orow two">
+         <label class="f" for="pp-over">Over odds${oddsField("pp-over", "-110")}</label>
+         <label class="f" for="pp-under">Under odds${oddsField("pp-under", "-110")}</label>
+       </div>`;
+  sheet(`<h4>Post a line</h4><b>${esc(nameOf(pr.player_id))} · ${esc(pr.stat)}</b>
+    ${lineBlock}
+    <div class="f">Starts${sheetTimePicker("pp-start", startPresets(), "", "Start date and time")}</div>
+    <div class="f">Ends${sheetTimePicker("pp-end", closePresets(), toLocalInput(nextAtHour(2)), "End date and time")}<span class="hint">Odds follow the clock from start to end. Betting closes at the end.</span></div>
+    ${others.length ? `<div class="f">Hide from (optional)<div class="chips hide-chips">${others.map(m =>
+      `<button type="button" data-pp-hide="${esc(m.id)}" aria-pressed="false">${esc(m.username)}</button>`).join("")}</div></div>` : ""}
+    <div class="err" id="pp-err"></div>
+    <button class="btn primary big" id="pp-save">Post line</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  wireSheetTimePickers();
+  document.querySelectorAll("[data-pp-hide]").forEach(btn => btn.onclick = () => {
+    const id = btn.dataset.ppHide; hidden.has(id) ? hidden.delete(id) : hidden.add(id);
+    btn.setAttribute("aria-pressed", String(hidden.has(id)));
+  });
+  $("#pp-save").onclick = async () => {
+    const err = $("#pp-err"), start = $("#pp-start").value, end = $("#pp-end").value;
+    let line = null, ov = null, un = null;
+    if (!sug.auto) {
+      line = Number($("#pp-line").value);
+      ov = Number(oddsValue("pp-over")); un = Number(oddsValue("pp-under"));
+      if ($("#pp-line").value.trim() === "" || !Number.isFinite(line) || line < 0) return (err.textContent = "Set a line, like 3.5.");
+      if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds need at least 100 (like −110 or +120). Tap ± to switch minus and plus.");
+    }
+    if (end && new Date(end) <= new Date()) return (err.textContent = "Pick an end time in the future.");
+    if (start && end && new Date(start) >= new Date(end)) return (err.textContent = "The end has to be after the start.");
+    $("#pp-save").disabled = true;
+    const { error } = await sb.rpc("create_prop_bet", {
+      p_prop: propId, p_line: line, p_over_odds: ov, p_under_odds: un,
+      p_closes_at: end ? new Date(end).toISOString() : null, p_starts_at: start ? new Date(start).toISOString() : null,
+      p_hidden: [...hidden] });
+    if (error) { err.textContent = errMsg(error); $("#pp-save").disabled = false; return; }
+    closeSheet(); toast("Line posted"); state.tab = "board"; state.filter = "open"; loadGroupData();
+  };
 }
 
 function slipHTML() {
@@ -684,6 +829,14 @@ document.addEventListener("click", async e => {
   if (t.id === "copyCode") {
     const code = group()?.invite_code || "";
     try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
+    return;
+  }
+  if (t.id === "newProp") return openNewProp();
+  if (t.dataset.postProp) return openPostProp(t.dataset.postProp);
+  if (t.dataset.gotoBet) {
+    const b = betById(t.dataset.gotoBet);
+    state.tab = "board"; state.filter = b?.status === "locked" ? "locked" : "open"; render();
+    setTimeout(() => document.querySelector(`[data-bet-card="${t.dataset.gotoBet}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
     return;
   }
   if (t.dataset.signFor) {

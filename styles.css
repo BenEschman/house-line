@@ -116,7 +116,7 @@ label.f,.f{display:flex;flex-direction:column;gap:6px;font-size:12px;font-weight
 .invite small{display:block;font-size:12px;color:var(--muted)}
 
 nav.tabs{position:fixed;left:0;right:0;bottom:0;z-index:6;background:var(--paper);border-top:1px solid var(--line);
-  display:grid;grid-template-columns:repeat(4,1fr);
+  display:grid;grid-template-columns:repeat(5,1fr);
   padding-left:max(8px,env(safe-area-inset-left,0px));padding-right:max(8px,env(safe-area-inset-right,0px));padding-block:6px calc(6px + env(safe-area-inset-bottom,0px))}
 nav.tabs button{border:0;background:none;display:flex;flex-direction:column;align-items:center;gap:2px;padding:6px 0;font-size:11px;font-weight:600;color:var(--muted)}
 nav.tabs button svg{width:22px;height:22px;stroke:currentColor;fill:none;stroke-width:1.8}
@@ -192,3 +192,29 @@ input[type=datetime-local].inp{min-height:46px}
 .sheet .seg{margin-bottom:0}
 .sheet .seg button{flex:1}
 .alt-tag{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;color:var(--chip);background:var(--chip-soft);padding:1px 6px;border-radius:999px;vertical-align:2px}
+
+/* player props */
+.props-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.props-head h2{margin:0}
+.player{margin-bottom:20px}
+.player-name{display:flex;align-items:center;gap:10px;margin:0 0 10px;font-size:16px}
+.player-name .initial{width:28px;height:28px;font-size:14px}
+.prop{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:14px;display:flex;flex-direction:column;gap:10px;box-shadow:var(--shadow)}
+.prop-top{display:flex;flex-direction:column;gap:2px}
+.prop-top b{font-size:17px}
+.prop-status{font-size:12px;color:var(--muted)}
+.results{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.results small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-right:2px}
+.results .res{font-family:var(--display);font-weight:700;font-size:17px;min-width:30px;text-align:center;padding:2px 6px;border-radius:8px;background:var(--bg);border:1px solid var(--line)}
+.results .res:first-of-type{border-color:var(--felt);color:var(--felt)}
+.prop-live{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--bg);border-radius:10px;padding:10px 12px;font-weight:600;font-size:14px;text-align:left}
+.prop-live .pill{margin:0}
+.prop-live .go{margin-left:auto;color:var(--felt)}
+.prop .btn.primary{align-self:flex-start}
+.prop-tag{font-size:10px;font-weight:800;letter-spacing:.08em;color:var(--felt-ink);background:var(--felt);padding:1px 6px;border-radius:4px;margin-right:6px}
+.bet p.prop-note{color:var(--ink);font-weight:600}
+.auto-line{display:flex;flex-direction:column;gap:2px;background:var(--felt-soft);border-radius:12px;padding:12px 14px}
+.auto-line small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.auto-line b{font-family:var(--display);font-size:40px;line-height:1;color:var(--felt)}
+.auto-line > span.num{font-weight:600}
+nav.tabs button{font-size:10.5px}

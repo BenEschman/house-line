@@ -1137,3 +1137,173 @@ end $$;
 revoke execute on function private.tick() from public, anon, authenticated;
 select cron.unschedule('house-line-lock-expired-bets');
 select cron.schedule('house-line-tick', '* * * * *', 'select private.tick()');
+
+-------------------------------------------------------------------------------
+-- Player props. A prop is a recurring stat about a group member; each posting
+-- is an O/U bet linked to it. The first 3 lines are set by hand; after 3
+-- settled results, lines and odds are set from a recency-weighted average.
+-- The prop's player can't post lines on it, bet on it, or settle it.
+-------------------------------------------------------------------------------
+
+create table public.props (
+  id          uuid primary key default gen_random_uuid(),
+  group_id    uuid not null references public.groups(id) on delete cascade,
+  player_id   uuid not null references public.profiles(id) on delete cascade,
+  stat        text not null check (char_length(stat) between 1 and 40),
+  created_by  uuid not null references public.profiles(id),
+  created_at  timestamptz not null default now(),
+  unique (group_id, player_id, stat)
+);
+create index props_group on public.props (group_id);
+alter table public.props enable row level security;
+create policy "members read props" on public.props
+  for select to authenticated using (private.is_member(group_id));
+
+alter table public.bets
+  add column prop_id uuid references public.props(id) on delete set null,
+  add column auto_line boolean not null default false;
+create index bets_prop on public.bets (prop_id);
+
+create or replace function private.prop_auto_threshold() returns int language sql immutable as $$ select 3 $$;
+
+create or replace function private.prop_player(b public.bets)
+returns uuid language sql stable security definer set search_path = public as $$
+  select player_id from props where id = b.prop_id
+$$;
+revoke execute on function private.prop_player(public.bets) from public, anon, authenticated;
+
+create or replace function private.can_manage_bet(b public.bets)
+returns boolean language sql stable security definer set search_path = public, private as $$
+  select (b.creator_id = auth.uid()
+          or (exists (select 1 from groups where id = b.group_id and owner_id = auth.uid())
+              and not exists (select 1 from bet_hidden where bet_id = b.id and user_id = auth.uid())))
+     and prop_player(b) is distinct from auth.uid()
+$$;
+revoke execute on function private.can_manage_bet(public.bets) from public, anon, authenticated;
+
+create or replace function public.create_prop(p_group uuid, p_player uuid, p_stat text)
+returns public.props language plpgsql security definer set search_path = public, private as $$
+declare pr props;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  if not exists (select 1 from memberships where group_id = p_group and user_id = p_player) then
+    raise exception 'Pick someone in this group';
+  end if;
+  if coalesce(trim(p_stat), '') = '' then raise exception 'Name the stat, like Drinks or Shots'; end if;
+  if exists (select 1 from props where group_id = p_group and player_id = p_player and lower(stat) = lower(trim(p_stat))) then
+    raise exception 'That prop already exists';
+  end if;
+  insert into props (group_id, player_id, stat, created_by)
+    values (p_group, p_player, trim(p_stat), auth.uid()) returning * into pr;
+  return pr;
+end $$;
+revoke execute on function public.create_prop(uuid, uuid, text) from public, anon;
+grant execute on function public.create_prop(uuid, uuid, text) to authenticated;
+
+create or replace function public.prop_suggestion(p_prop uuid)
+returns jsonb language plpgsql stable security definer set search_path = public, private as $$
+declare
+  pr props; n int; mu double precision; best_k int := 0; best_d double precision := 2; p double precision;
+  p_over double precision; ovr double precision := 2 * 110.0 / 210.0;
+  finals numeric[];
+begin
+  select * into pr from props where id = p_prop;
+  if not found or not is_member(pr.group_id) then raise exception 'Prop not found'; end if;
+  select array_agg(final_value order by settled_at desc) into finals
+    from (select final_value, settled_at from bets
+          where prop_id = p_prop and status = 'settled' and final_value is not null
+          order by settled_at desc limit 10) t;
+  n := coalesce(array_length(finals, 1), 0);
+  if n < prop_auto_threshold() then
+    return jsonb_build_object('auto', false, 'results', n, 'needed', prop_auto_threshold());
+  end if;
+  select sum(f * power(0.8, i - 1)) / sum(power(0.8, i - 1)) into mu
+    from unnest(finals) with ordinality as t(f, i);
+  for k in 0 .. greatest(10, ceil(mu * 3)::int + 5) loop
+    p := poisson_at_least(k + 1, mu);
+    if abs(p - 0.5) < best_d then best_d := abs(p - 0.5); best_k := k; p_over := p; end if;
+  end loop;
+  return jsonb_build_object('auto', true, 'results', n, 'needed', prop_auto_threshold(),
+    'mean', round(mu::numeric, 2), 'line', best_k + 0.5,
+    'over_odds', prob_to_american(p_over * ovr), 'under_odds', prob_to_american((1 - p_over) * ovr));
+end $$;
+revoke execute on function public.prop_suggestion(uuid) from public, anon;
+grant execute on function public.prop_suggestion(uuid) to authenticated;
+
+create or replace function public.create_prop_bet(
+  p_prop uuid, p_line numeric, p_over_odds int, p_under_odds int,
+  p_closes_at timestamptz default null, p_starts_at timestamptz default null, p_hidden uuid[] default '{}')
+returns uuid language plpgsql security definer set search_path = public, private as $$
+declare pr props; s jsonb; uname text; line numeric; ov int; un int; b uuid; auto boolean;
+begin
+  select * into pr from props where id = p_prop;
+  if not found or not is_member(pr.group_id) then raise exception 'Prop not found'; end if;
+  if pr.player_id = auth.uid() then raise exception 'You can''t post lines on your own prop'; end if;
+  if exists (select 1 from bets where prop_id = p_prop and status in ('open', 'locked')) then
+    raise exception 'This prop already has a line up. Settle or void it first.';
+  end if;
+  s := prop_suggestion(p_prop);
+  auto := (s ->> 'auto')::boolean;
+  if auto then
+    line := (s ->> 'line')::numeric; ov := (s ->> 'over_odds')::int; un := (s ->> 'under_odds')::int;
+  else
+    if p_line is null or p_line < 0 then raise exception 'Set a line, like 3.5'; end if;
+    if p_over_odds is null or p_under_odds is null or abs(p_over_odds) < 100 or abs(p_under_odds) < 100 then
+      raise exception 'Odds need at least 100 (like -110 or +120)';
+    end if;
+    line := p_line; ov := p_over_odds; un := p_under_odds;
+  end if;
+  select username into uname from profiles where id = pr.player_id;
+  b := create_bet(pr.group_id, uname || ' · ' || pr.stat, '', line,
+         jsonb_build_array(jsonb_build_object('label', 'Over ' || line, 'odds', ov),
+                           jsonb_build_object('label', 'Under ' || line, 'odds', un)),
+         p_hidden, p_closes_at, p_starts_at);
+  update bets set prop_id = p_prop, auto_line = auto where id = b;
+  return b;
+end $$;
+revoke execute on function public.create_prop_bet(uuid, numeric, int, int, timestamptz, timestamptz, uuid[]) from public, anon;
+grant execute on function public.create_prop_bet(uuid, numeric, int, int, timestamptz, timestamptz, uuid[]) to authenticated;
+
+create or replace function private.do_wager(p_bet uuid, p_outcome uuid, p_side text, p_line numeric, p_stake int, p_expected int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare b bets; o outcomes; m memberships; w wagers; now_p int; prev_p int; use_odds int;
+begin
+  select * into b from bets where id = p_bet for share;
+  if not found or hidden_from_me(p_bet) or not is_member(b.group_id) then raise exception 'That bet no longer exists'; end if;
+  if prop_player(b) = auth.uid() then raise exception 'You can''t bet on your own prop'; end if;
+  if b.creator_id = auth.uid() and not b.auto_line then raise exception 'You can''t bet on your own line'; end if;
+  if b.closes_at is not null and now() >= b.closes_at then raise exception 'Betting on this closed'; end if;
+  if b.status <> 'open' then raise exception 'This bet is closed to new wagers'; end if;
+  if p_stake is null or p_stake < 1 then raise exception 'Stake must be at least 1 token'; end if;
+  if p_outcome is null then
+    select * into o from outcomes where bet_id = b.id and position = case when p_side = 'over' then 0 else 1 end;
+  else
+    select * into o from outcomes where id = p_outcome and bet_id = b.id;
+    if not found then raise exception 'That outcome no longer exists'; end if;
+  end if;
+  now_p := price_outcome(b, o, p_line, p_side, now());
+  if p_expected is null then
+    use_odds := now_p;
+  else
+    prev_p := price_outcome(b, o, p_line, p_side, now() - interval '1 minute');
+    if odds_close(p_expected, now_p) or odds_close(p_expected, prev_p) then
+      use_odds := p_expected;
+    else
+      raise exception 'Odds moved to %. Check the new price and try again.',
+        case when now_p > 0 then '+' || now_p else now_p::text end;
+    end if;
+  end if;
+  select * into m from memberships where group_id = b.group_id and user_id = auth.uid() for update;
+  if not found then raise exception 'You are not in this group'; end if;
+  if m.balance < p_stake then raise exception 'Not enough tokens: you have %', m.balance; end if;
+  update memberships set balance = balance - p_stake where group_id = b.group_id and user_id = auth.uid();
+  insert into wagers (group_id, bet_id, outcome_id, user_id, stake, odds, line, side)
+    values (b.group_id, b.id, o.id, auth.uid(), p_stake, use_odds,
+            case when p_outcome is null then p_line end, case when p_outcome is null then p_side end)
+    returning * into w;
+  perform reprice_bet(b.id);
+  return w;
+end $$;
+revoke execute on function private.do_wager(uuid, uuid, text, numeric, int, int) from public, anon, authenticated;
+
+alter publication supabase_realtime add table public.props;
