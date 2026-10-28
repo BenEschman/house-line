@@ -161,3 +161,10 @@ input[type=range]{width:100%;accent-color:var(--felt)}
 .quote small{font-size:12px;color:var(--muted);overflow-wrap:anywhere}
 .quote b{font-family:var(--display);font-size:28px;color:var(--felt);line-height:1.1}
 .quote span{font-size:11px;color:var(--muted)}
+
+/* own line + hidden bets */
+.bet p.note{margin:2px 0 0;font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.bet p.hidden-note{color:var(--warn)}
+.bet p.note svg{width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;flex:none}
+.hide-chips button{text-transform:none;letter-spacing:0;font-size:14px}
+.hide-chips button[aria-pressed="true"]{background:var(--ink);color:var(--bg);border-color:var(--ink);text-decoration:line-through}

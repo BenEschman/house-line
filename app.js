@@ -6,11 +6,11 @@ const configured = cfg.supabaseUrl && !cfg.supabaseUrl.includes("YOUR-PROJECT") 
 const sb = configured ? window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey) : null;
 
 const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdds: "-110", underOdds: "-110",
-  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }] });
+  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [] });
 
 const state = {
   session: null, groups: [], groupId: null,
-  bets: [], wagers: [], members: [], loaded: false,
+  bets: [], wagers: [], members: [], hidden: {}, loaded: false,
   tab: "board", filter: "open", authMode: "signin", draft: blankDraft(), channel: null,
 };
 
@@ -84,10 +84,11 @@ async function openGroup(id) {
 
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
-  const [bets, wagers, members] = await Promise.all([
+  const [bets, wagers, members, hidden] = await Promise.all([
     sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username)").eq("group_id", gid),
+    sb.from("bet_hidden").select("bet_id, user_id").eq("group_id", gid),
   ]);
   if (gid !== state.groupId) return;
   const err = bets.error || wagers.error || members.error;
@@ -95,6 +96,8 @@ async function loadGroupData() {
   state.bets = (bets.data || []).map(b => ({ ...b, outcomes: (b.outcomes || []).sort((x, y) => x.position - y.position) }));
   state.wagers = wagers.data || [];
   state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player" }));
+  state.hidden = {};
+  for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
   state.loaded = true;
   render();
 }
@@ -105,7 +108,7 @@ function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(
 function subscribe(gid) {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel("group-" + gid);
-  for (const table of ["bets", "outcomes", "wagers", "memberships"])
+  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden"])
     ch.on("postgres_changes", { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
   ch.subscribe();
   state.channel = ch;
@@ -221,9 +224,12 @@ function betCard(b) {
   const mineBy = {};
   for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid()) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
   const open = b.status === "open";
+  const mine = b.creator_id === uid();
+  const canBet = open && !mine;
+  const hiddenFrom = (state.hidden[b.id] || []).map(nameOf);
   const outs = b.outcomes.map(o => {
     const cls = b.status === "settled" ? (o.id === b.winning_outcome_id ? "won" : "lost") : "";
-    return `<button class="out ${cls}" data-bet="${esc(b.id)}" data-out="${esc(o.id)}" ${open ? "" : "disabled"}>
+    return `<button class="out ${cls}" data-bet="${esc(b.id)}" data-out="${esc(o.id)}" ${canBet ? "" : "disabled"}>
       <span class="lbl">${esc(o.label)}</span>
       <span class="odds num">${fmtOdds(o.odds)}</span>
       ${o.open_odds != null && o.open_odds !== o.odds ? `<span class="opened num">opened ${fmtOdds(o.open_odds)}</span>` : ""}
@@ -242,6 +248,8 @@ function betCard(b) {
       <div class="bet-meta"><span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
+      ${mine && open ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
+      ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
       ${b.live_updated_at ? `<div class="livebar"><span class="dot${live ? "" : " off"}"></span><b class="num">${esc(String(Number(b.live_current)))}</b>&nbsp;so far · <span class="num">${Math.round(Number(b.live_progress) * 100)}%</span>&nbsp;through<span class="when">${agoText(b.live_updated_at)}</span>
         <div class="prog" aria-hidden="true"><i style="width:${Math.round(Number(b.live_progress) * 100)}%"></i></div></div>` : ""}
     </div>
@@ -274,9 +282,20 @@ function createHTML() {
     <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
     <label class="f" for="c-detail">Details (optional)<input class="inp" id="c-detail" maxlength="240" placeholder="Settled by stopwatch at the table" value="${esc(d.detail)}"></label>
     ${body}
+    ${hidePicker()}
     <div class="err" id="c-err"></div>
     <button class="btn primary big" type="submit">Post bet</button>
   </form>`;
+}
+
+function hidePicker() {
+  const others = state.members.filter(m => m.id !== uid()).sort((a, b) => a.username.localeCompare(b.username));
+  if (!others.length) return "";
+  const h = state.draft.hidden;
+  return `<div class="f">Hide from (optional)
+    <div class="chips hide-chips">${others.map(m => `<button type="button" data-hide="${esc(m.id)}" aria-pressed="${h.includes(m.id)}">${esc(m.username)}</button>`).join("")}</div>
+    <span class="hint">${h.length ? `${h.length} ${h.length === 1 ? "person" : "people"} won’t see this bet, its odds, or who bet on it.` : "Pick anyone who shouldn’t see this bet."}</span>
+  </div>`;
 }
 
 function slipHTML() {
@@ -465,6 +484,12 @@ document.addEventListener("click", async e => {
   }
   if (!t.closest("#app")) return;
   if (t.dataset.filter) { state.filter = t.dataset.filter; return render(); }
+  if (t.dataset.hide) {
+    syncDraft();
+    const h = state.draft.hidden, id = t.dataset.hide;
+    state.draft.hidden = h.includes(id) ? h.filter(x => x !== id) : [...h, id];
+    return render();
+  }
   if (t.dataset.type) { syncDraft(); state.draft.type = t.dataset.type; return render(); }
   if (t.id === "c-add") { syncDraft(); state.draft.outcomes.push({ label: "", odds: "+100" }); return render(); }
   if (t.dataset.rm) { syncDraft(); state.draft.outcomes.splice(+t.dataset.rm, 1); return render(); }
@@ -536,7 +561,7 @@ document.addEventListener("submit", async e => {
       if (outcomes.some(o => !validOdds(o.odds))) return (err.textContent = "Odds must be −100 or lower, or +100 or higher (like −110 or +250).");
     }
     busy(true);
-    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes });
+    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden });
     busy(false);
     if (error) return (err.textContent = errMsg(error));
     state.draft = { ...blankDraft(), type: d.type };

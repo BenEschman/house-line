@@ -515,3 +515,124 @@ begin
     from jsonb_array_elements(p_outcomes) with ordinality as t(o, ord);
   return b;
 end $$;
+
+-------------------------------------------------------------------------------
+-- Hidden bets (creator picks group members who can't see a bet) and
+-- no betting on your own line.
+-------------------------------------------------------------------------------
+
+create table public.bet_hidden (
+  bet_id    uuid not null references public.bets(id) on delete cascade,
+  user_id   uuid not null references public.profiles(id) on delete cascade,
+  group_id  uuid not null references public.groups(id) on delete cascade,
+  primary key (bet_id, user_id)
+);
+create index bet_hidden_user on public.bet_hidden (user_id);
+alter table public.bet_hidden enable row level security;
+
+create or replace function private.hidden_from_me(p_bet uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from bet_hidden where bet_id = p_bet and user_id = auth.uid())
+$$;
+create or replace function private.created_by_me(p_bet uuid)
+returns boolean language sql stable security definer set search_path = public as $$
+  select exists (select 1 from bets where id = p_bet and creator_id = auth.uid())
+$$;
+revoke execute on function private.hidden_from_me(uuid) from public, anon;
+revoke execute on function private.created_by_me(uuid) from public, anon;
+grant execute on function private.hidden_from_me(uuid) to authenticated;
+grant execute on function private.created_by_me(uuid) to authenticated;
+
+create policy "creator reads hidden list" on public.bet_hidden
+  for select to authenticated using (private.created_by_me(bet_id));
+
+drop policy "members read bets" on public.bets;
+drop policy "members read outcomes" on public.outcomes;
+drop policy "members read wagers" on public.wagers;
+create policy "members read visible bets" on public.bets
+  for select to authenticated using (private.is_member(group_id) and not private.hidden_from_me(id));
+create policy "members read visible outcomes" on public.outcomes
+  for select to authenticated using (private.is_member(group_id) and not private.hidden_from_me(bet_id));
+create policy "members read visible wagers" on public.wagers
+  for select to authenticated using (private.is_member(group_id) and not private.hidden_from_me(bet_id));
+
+drop function public.create_bet(uuid, text, text, numeric, jsonb);
+create function public.create_bet(
+  p_group uuid, p_title text, p_detail text, p_line numeric, p_outcomes jsonb,
+  p_hidden uuid[] default '{}')
+returns uuid language plpgsql security definer set search_path = public, private as $$
+declare
+  b uuid;
+  n int;
+begin
+  if not is_member(p_group) then raise exception 'You are not in this group'; end if;
+  n := jsonb_array_length(coalesce(p_outcomes, '[]'::jsonb));
+  if n < 2 or n > 8 then raise exception 'A bet needs 2 to 8 outcomes'; end if;
+  if auth.uid() = any(coalesce(p_hidden, '{}')) then raise exception 'You can''t hide a bet from yourself'; end if;
+  if exists (select 1 from unnest(coalesce(p_hidden, '{}')) h(uid)
+             where not exists (select 1 from memberships where group_id = p_group and user_id = h.uid)) then
+    raise exception 'You can only hide bets from people in this group';
+  end if;
+  insert into bets (group_id, creator_id, title, detail, line)
+    values (p_group, auth.uid(), trim(p_title), coalesce(trim(p_detail), ''), p_line)
+    returning id into b;
+  insert into outcomes (bet_id, group_id, label, odds, open_odds, position)
+    select b, p_group, trim(o ->> 'label'), (o ->> 'odds')::int, (o ->> 'odds')::int, (ord - 1)::int
+    from jsonb_array_elements(p_outcomes) with ordinality as t(o, ord);
+  insert into bet_hidden (bet_id, user_id, group_id)
+    select distinct b, uid, p_group from unnest(coalesce(p_hidden, '{}')) as h(uid);
+  return b;
+end $$;
+revoke execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[]) from public, anon;
+grant execute on function public.create_bet(uuid, text, text, numeric, jsonb, uuid[]) to authenticated;
+
+create or replace function public.place_wager(p_outcome uuid, p_stake int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare
+  o outcomes;
+  b bets;
+  m memberships;
+  w wagers;
+begin
+  select * into o from outcomes where id = p_outcome;
+  if not found or hidden_from_me(o.bet_id) then raise exception 'That outcome no longer exists'; end if;
+  select * into b from bets where id = o.bet_id for share;
+  if b.creator_id = auth.uid() then raise exception 'You can''t bet on your own line'; end if;
+  if b.status <> 'open' then raise exception 'This bet is closed to new wagers'; end if;
+  if p_stake is null or p_stake < 1 then raise exception 'Stake must be at least 1 token'; end if;
+  select * into m from memberships
+    where group_id = b.group_id and user_id = auth.uid() for update;
+  if not found then raise exception 'You are not in this group'; end if;
+  if m.balance < p_stake then
+    raise exception 'Not enough tokens: you have %', m.balance;
+  end if;
+  update memberships set balance = balance - p_stake
+    where group_id = b.group_id and user_id = auth.uid();
+  insert into wagers (group_id, bet_id, outcome_id, user_id, stake, odds)
+    values (b.group_id, b.id, o.id, auth.uid(), p_stake, o.odds)
+    returning * into w;
+  return w;
+end $$;
+
+create or replace function public.place_wager(p_outcome uuid, p_stake int, p_expected_odds int)
+returns public.wagers language plpgsql security definer set search_path = public, private as $$
+declare cur int; bet uuid;
+begin
+  select odds, bet_id into cur, bet from outcomes where id = p_outcome;
+  if bet is null or hidden_from_me(bet) then raise exception 'That outcome no longer exists'; end if;
+  if cur is distinct from p_expected_odds then
+    raise exception 'Odds moved to %. Check the new price and try again.',
+      case when cur > 0 then '+' || cur else cur::text end;
+  end if;
+  return public.place_wager(p_outcome, p_stake);
+end $$;
+
+create or replace function private.can_manage_bet(b public.bets)
+returns boolean language sql stable security definer set search_path = public as $$
+  select b.creator_id = auth.uid()
+      or (exists (select 1 from groups where id = b.group_id and owner_id = auth.uid())
+          and not exists (select 1 from bet_hidden where bet_id = b.id and user_id = auth.uid()))
+$$;
+revoke execute on function private.can_manage_bet(public.bets) from public, anon, authenticated;
+
+alter publication supabase_realtime add table public.bet_hidden;
