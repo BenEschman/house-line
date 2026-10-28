@@ -296,18 +296,44 @@ function poolFor(betId) {
   return pool;
 }
 
+// Bets are grouped by the local day they start (start time, else when they were posted).
+const betStart = b => new Date(b.starts_at || b.created_at);
+const dayKey = d => `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
+function dayLabel(key) {
+  const [y, m, d] = key.split("-").map(Number), day = new Date(y, m - 1, d);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const diff = Math.round((day - today) / 86400000);
+  const date = day.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric", ...(day.getFullYear() !== today.getFullYear() ? { year: "numeric" } : {}) });
+  const rel = diff === 0 ? "Today" : diff === 1 ? "Tomorrow" : diff === -1 ? "Yesterday" : "";
+  return { rel, date };
+}
+// newestFirst: settled lists read best from most recent back.
+function dayGroupsHTML(bets, newestFirst = false) {
+  const groups = new Map();
+  for (const b of [...bets].sort((x, y) => (betStart(x) - betStart(y)) * (newestFirst ? -1 : 1)))
+    (groups.get(dayKey(betStart(b))) || groups.set(dayKey(betStart(b)), []).get(dayKey(betStart(b)))).push(b);
+  return [...groups].map(([key, list]) => {
+    const { rel, date } = dayLabel(key);
+    return `<section class="day">
+      <h3 class="day-head"><span>${rel ? `<b>${rel}</b> · ` : ""}${esc(date)}</span><small>${list.length} ${list.length === 1 ? "bet" : "bets"}</small></h3>
+      <div class="list">${list.map(betCard).join("")}</div>
+    </section>`;
+  }).join("");
+}
+
 function boardHTML() {
   const bucket = b => b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
+  const boardBets = state.bets.filter(b => !b.prop_id);          // prop lines live on the Props tab
   const counts = { open: 0, locked: 0, done: 0 };
-  state.bets.forEach(b => counts[bucket(b)]++);
-  const shown = state.bets.filter(b => bucket(b) === state.filter);
+  boardBets.forEach(b => counts[bucket(b)]++);
+  const shown = boardBets.filter(b => bucket(b) === state.filter);
   const seg = `<div class="seg" role="group" aria-label="Filter bets">${[["open", "Open"], ["locked", "Locked"], ["done", "Settled"]]
     .map(([k, l]) => `<button data-filter="${k}" aria-pressed="${state.filter === k}">${l} · ${counts[k]}</button>`).join("")}</div>`;
   if (!state.loaded) return seg + `<div class="empty"><b>Loading the board…</b></div>`;
   if (!shown.length) return seg + (state.filter === "open"
-    ? `<div class="empty"><b>No open bets yet</b>Tap New bet to post the first line, like “Jake finishes the burrito, O/U 12.5 min.”</div>`
+    ? `<div class="empty"><b>No open bets yet</b>Tap New bet to post the first line, like “Jake finishes the burrito, O/U 12.5 min.” Player props are on the Props tab.</div>`
     : `<div class="empty"><b>Nothing here yet</b>Bets move here when their creator locks or settles them.</div>`);
-  return seg + `<div class="list">${shown.map(betCard).join("")}</div>`;
+  return seg + dayGroupsHTML(shown, state.filter === "done");
 }
 
 function betCard(b) {
@@ -340,13 +366,13 @@ function betCard(b) {
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
   return `<article class="bet" data-bet-card="${esc(b.id)}">
     <div class="bet-head">
-      <div class="bet-meta">${avatarHTML(b.creator_id, 18)}<span>${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
+      <div class="bet-meta">${avatarHTML(b.creator_id, 18)}<span>${b.starts_at ? `<b class="start-time">${esc(betStart(b).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</b> · ` : ""}${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(prop ? `${usernameOf(prop.player_id)} · ${prop.stat}` : b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
       ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Ended ${esc(fmtClose(b.closes_at))} · waiting for ${esc(b.creator_id === uid() ? "you" : nameOf(b.creator_id))} to settle` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
       ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
       ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
-      ${prop ? `<p class="note prop-note"><span class="prop-tag">PROP</span>${esc(nameOf(prop.player_id))} · ${esc(prop.stat)}${b.auto_line ? ` <span class="alt-tag">auto line</span>` : ""}</p>` : ""}
+      ${prop && state.tab !== "props" ? `<p class="note prop-note"><span class="prop-tag">PROP</span>${esc(nameOf(prop.player_id))} · ${esc(prop.stat)}${b.auto_line ? ` <span class="alt-tag">auto line</span>` : ""}</p>` : ""}
       ${myProp && open ? `<p class="note">This prop is about you, so you can't bet on it.</p>` : ""}
       ${ownLineLocked && open && !myProp ? `<p class="note">Your line. You can't bet on it.</p>` : ""}
       ${hiddenFrom.length ? `<p class="note hidden-note"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 3l18 18M10.6 6.1A10 10 0 0 1 12 6c5 0 9 6 9 6a17 17 0 0 1-3.1 3.6M6.6 6.6C4.3 8.1 3 12 3 12s4 6 9 6c1.7 0 3.2-.5 4.5-1.2M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>Hidden from ${esc(hiddenFrom.join(", "))}</p>` : ""}
@@ -453,7 +479,12 @@ function propsHTML() {
     <div class="chips">${chip("data-pf-player", "", "Everyone", !state.propPlayer)}${players.map(id => chip("data-pf-player", id, id === uid() ? "You" : nameOf(id), state.propPlayer === id)).join("")}</div>
   </div>`;
   const shown = stats.filter(sg => !state.propStat || sg.stat.toLowerCase() === state.propStat);
-  return head + bar + shown.map(sg => {
+  const lineMatch = b => { const pr = propOf(b); return pr && (!state.propStat || pr.stat.toLowerCase() === state.propStat) && (!state.propPlayer || pr.player_id === state.propPlayer); };
+  const live = state.bets.filter(b => b.prop_id && (b.status === "open" || b.status === "locked") && lineMatch(b));
+  const lines = live.length
+    ? `<h2 class="sub-head">Lines</h2>${dayGroupsHTML(live)}`
+    : `<div class="empty slim"><b>No prop lines up${state.propStat || state.propPlayer ? " for this filter" : ""}</b>Tap Post lines on a stat below to put some up.</div>`;
+  return head + bar + lines + `<h2 class="sub-head">Stat lines</h2>` + shown.map(sg => {
     const rows = [...sg.props].filter(pr => !state.propPlayer || pr.player_id === state.propPlayer)
       .sort((x, y) => nameOf(x.player_id).localeCompare(nameOf(y.player_id)));
     if (!rows.length) return "";
@@ -577,7 +608,7 @@ async function openPostSlate(stat, onlyPlayer = "") {
       p_lines: lines, p_closes_at: end ? new Date(end).toISOString() : null,
       p_starts_at: start ? new Date(start).toISOString() : null, p_hidden: [...hidden] });
     if (error) { err.textContent = errMsg(error); $("#sl-save").disabled = false; return; }
-    closeSheet(); toast(`Posted ${data} ${stat} ${data === 1 ? "line" : "lines"}`); state.tab = "board"; state.filter = "open"; loadGroupData();
+    closeSheet(); toast(`Posted ${data} ${stat} ${data === 1 ? "line" : "lines"}`); state.tab = "props"; window.scrollTo(0, 0); loadGroupData();
   };
 }
 
@@ -1055,6 +1086,26 @@ function openPassword() {
   };
 }
 
+// Show a bet wherever it lives (Props tab for prop lines, Board otherwise) and highlight it.
+function goToBet(id) {
+  const b = betById(id);
+  if (b?.prop_id && propOf(b)) {
+    state.tab = "props";
+    const pr = propOf(b);
+    if (state.propStat && state.propStat !== pr.stat.toLowerCase()) state.propStat = "";
+    if (state.propPlayer && state.propPlayer !== pr.player_id) state.propPlayer = "";
+  } else {
+    state.tab = "board";
+    state.filter = !b ? "open" : b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
+  }
+  render();
+  if (b) setTimeout(() => {
+    const el = document.querySelector(`[data-bet-card="${id}"]`);
+    el?.scrollIntoView({ behavior: "smooth", block: "center" });
+    el?.classList.add("flash"); setTimeout(() => el?.classList.remove("flash"), 1600);
+  }, 80);
+}
+
 /* ---------------- notifications ---------------- */
 
 const VAPID_PUBLIC = "BGewTeQH_00NJL5k1zEEzQB8dMu5sEcmr4jb4ycVOyR4OSOeqpnAkpDpd4o1IMIEyw5IrtxbQKC9c6Gxi5gIpEA";
@@ -1129,15 +1180,10 @@ async function openNotification(id) {
   const n = state.notifs.find(x => x.id === id); if (!n) return;
   if (n.group_id && n.group_id !== state.groupId && state.groups.some(g => g.id === n.group_id)) await openGroup(n.group_id);
   if (n.kind === "joined") { state.tab = "leaders"; return render(); }
-  state.tab = "board";
-  const b = n.bet_id && betById(n.bet_id);
-  state.filter = !b ? "open" : b.status === "open" ? "open" : b.status === "locked" ? "locked" : "done";
-  render();
-  if (b) setTimeout(() => {
-    const el = document.querySelector(`[data-bet-card="${n.bet_id}"]`);
-    el?.scrollIntoView({ behavior: "smooth", block: "center" });
-    el?.classList.add("flash"); setTimeout(() => el?.classList.remove("flash"), 1600);
-  }, 80);
+  if (n.bet_id) return goToBet(n.bet_id);
+  // Collapsed "N new lines" notifications have no single bet: open the tab they're about.
+  state.tab = n.kind === "new_line" && (n.data?.count ?? 1) > 1 && state.props.length ? "props" : "board";
+  state.filter = "open"; render();
 }
 // Tapping a push opens ./?n=<id>; handle it once notifications are loaded.
 let pendingNotif = new URLSearchParams(location.search).get("n");
@@ -1293,12 +1339,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.pfStat !== undefined) { state.propStat = t.dataset.pfStat; return render(); }
   if (t.dataset.pfPlayer !== undefined) { state.propPlayer = t.dataset.pfPlayer; return render(); }
   if (t.dataset.postStat) return openPostSlate(t.dataset.postStat, t.dataset.postOnly || "");
-  if (t.dataset.gotoBet) {
-    const b = betById(t.dataset.gotoBet);
-    state.tab = "board"; state.filter = b?.status === "locked" ? "locked" : "open"; render();
-    setTimeout(() => document.querySelector(`[data-bet-card="${t.dataset.gotoBet}"]`)?.scrollIntoView({ behavior: "smooth", block: "center" }), 50);
-    return;
-  }
+  if (t.dataset.gotoBet) return goToBet(t.dataset.gotoBet);
   if (t.dataset.signFor) {
     const neg = t.textContent.trim().startsWith("−");
     t.innerHTML = `${neg ? "+" : "−"}<small>±</small>`;

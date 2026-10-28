@@ -348,3 +348,16 @@ nav.tabs.away{transform:translateY(calc(100% + 2px))}
   .wallet small{display:none}
   .top-row{gap:10px}
 }
+
+/* bets grouped by day */
+.day{margin-bottom:18px}
+.day-head{position:sticky;top:calc(env(safe-area-inset-top,0px) + 62px);z-index:3;display:flex;align-items:baseline;justify-content:space-between;gap:8px;
+  margin:0 calc(-1 * var(--gutter-r)) 8px calc(-1 * var(--gutter-l));padding:8px var(--gutter-r) 8px var(--gutter-l);
+  background:var(--bg);font-size:14px;font-weight:600;color:var(--muted);text-transform:none;letter-spacing:0;font-family:var(--body)}
+.day-head b{color:var(--ink);font-family:var(--display);font-size:18px;text-transform:uppercase;letter-spacing:.04em}
+.day-head small{font-size:12px;font-weight:500}
+.bet-meta .start-time{color:var(--ink);font-weight:700}
+.sub-head{font-size:18px;margin:6px 0 8px}
+.empty.slim{padding:18px;margin-bottom:12px}
+/* on Props the filter bar is sticky too, so day headers sit below it */
+.prop-filter ~ .day .day-head{position:static;margin-left:0;margin-right:0;padding-left:0;padding-right:0}
