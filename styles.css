@@ -387,3 +387,14 @@ details.day[open] > .list{padding-bottom:6px}
 .prop-open .bet{box-shadow:none}
 .prop-open.none{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:14px;color:var(--muted)}
 .prop-item.open .av.initial{background:var(--paper)}
+
+/* cash out */
+.cash-btn{margin-top:8px;padding:6px 12px;font-size:13px;color:var(--felt);border-color:var(--felt)}
+.cash-quote{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.cash-quote > div{background:var(--bg);border-radius:12px;padding:12px;display:flex;flex-direction:column;gap:2px;min-width:0}
+.cash-quote > div:first-child{background:var(--felt-soft)}
+.cash-quote small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.cash-quote b{font-family:var(--display);font-size:32px;line-height:1.05}
+.cash-quote > div:first-child b{color:var(--felt)}
+.cash-quote span{font-size:12px;font-weight:600}
+.cash-quote .hint{grid-column:1/-1;margin:0}

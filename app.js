@@ -59,7 +59,7 @@ function ouModel(b) {
 }
 function sideStakes(b) {
   let over = 0, under = 0;
-  for (const w of state.wagers) if (w.bet_id === b.id) {
+  for (const w of state.wagers) if (w.bet_id === b.id && !w.cashed_out_at) {
     ((w.side || (w.outcome_id === b.outcomes[0].id ? "over" : "under")) === "over") ? over += w.stake : under += w.stake;
   }
   return { over, under };
@@ -75,8 +75,8 @@ function priceOU(b, line, side, t = Date.now()) {
   return toAmerican((side === "over" ? p : 1 - p) * m.ovr);
 }
 function priceCustom(b, o) {
-  const stakeOn = id => state.wagers.reduce((a, w) => a + (w.bet_id === b.id && w.outcome_id === id ? w.stake : 0), 0);
-  if (state.wagers.every(w => w.bet_id !== b.id)) return o.open_odds ?? o.odds;
+  const stakeOn = id => state.wagers.reduce((a, w) => a + (w.bet_id === b.id && w.outcome_id === id && !w.cashed_out_at ? w.stake : 0), 0);
+  if (state.wagers.every(w => w.bet_id !== b.id || w.cashed_out_at)) return o.open_odds ?? o.odds;
   const ovr = b.outcomes.reduce((a, x) => a + impliedProb(x.open_odds ?? x.odds), 0);
   let num = 0, den = 0;
   for (const x of b.outcomes) {
@@ -217,7 +217,7 @@ function myStats() {
     if (w.user_id !== uid()) continue;
     const b = betById(w.bet_id);
     if (w.payout == null) risk += w.stake;
-    else if (b?.status === "settled") (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
+    else if (b?.status === "settled" && !w.cashed_out_at) (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
   }
   return { bal: me()?.balance ?? 0, risk, won, lost };
 }
@@ -225,7 +225,7 @@ function recordOf(id) {
   let won = 0, lost = 0, risk = 0;
   for (const w of state.wagers) if (w.user_id === id) {
     if (w.payout == null) risk += w.stake;
-    else if (betById(w.bet_id)?.status === "settled") (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
+    else if (betById(w.bet_id)?.status === "settled" && !w.cashed_out_at) (w.payout > w.stake ? won++ : w.payout === 0 ? lost++ : 0);
   }
   return { won, lost, risk };
 }
@@ -292,7 +292,7 @@ function joinCreateForms() {
 
 function poolFor(betId) {
   const pool = {};
-  for (const w of state.wagers) if (w.bet_id === betId) pool[w.outcome_id] = (pool[w.outcome_id] || 0) + w.stake;
+  for (const w of state.wagers) if (w.bet_id === betId && !w.cashed_out_at) pool[w.outcome_id] = (pool[w.outcome_id] || 0) + w.stake;
   return pool;
 }
 
@@ -343,7 +343,7 @@ function boardHTML() {
 function betCard(b) {
   const pool = poolFor(b.id);
   const mineBy = {};
-  for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid()) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
+  for (const w of state.wagers) if (w.bet_id === b.id && w.user_id === uid() && !w.cashed_out_at) mineBy[w.outcome_id] = (mineBy[w.outcome_id] || 0) + w.stake;
   const open = b.status === "open";
   const mine = b.creator_id === uid();
   const prop = propOf(b), myProp = prop?.player_id === uid();
@@ -634,13 +634,16 @@ function slipHTML() {
   return `<h2>My slip</h2>${stats}<div class="list">${ws.map(w => {
     const b = betById(w.bet_id); const o = b?.outcomes.find(x => x.id === w.outcome_id);
     let right, status;
+    const canCash = w.payout == null && b?.status === "open" && !isPast(b?.closes_at);
     if (w.payout == null) { status = "pending"; right = `<span>to win ${fmtTok(returns(w.stake, w.odds) - w.stake)}</span>`; }
+    else if (w.cashed_out_at) { const net = w.payout - w.stake; status = "cashed out"; right = `<span class="${net > 0 ? "pos" : net < 0 ? "neg" : ""}">${net > 0 ? "+" : net < 0 ? "−" : ""}${fmtTok(Math.abs(net))}</span>`; }
     else if (b?.status === "void") { status = "voided"; right = `<span>refunded</span>`; }
     else if (w.payout === w.stake) { status = "push"; right = `<span>refunded</span>`; }
     else if (w.payout > 0) { status = "won"; right = `<span class="pos">+${fmtTok(w.payout - w.stake)}</span>`; }
     else { status = "lost"; right = `<span class="neg">−${fmtTok(w.stake)}</span>`; }
     return `<div class="row"><div class="main"><div class="t">${esc(w.line != null ? `${sideLabel(w.side)} ${Number(w.line)}` : o?.label || "Outcome")}${w.line != null ? ` <span class="alt-tag">alt line</span>` : ""} <span class="num" style="color:var(--felt)">${fmtOdds(w.odds)}</span></div>
-      <div class="s">${esc(b?.title || "Bet")} · ${fmtTok(w.stake)} staked · ${status}</div></div><div class="amt num">${right}</div></div>`;
+      <div class="s">${esc(b ? betTitle(b) : "Bet")} · ${fmtTok(w.stake)} staked · ${status}</div>
+      ${canCash ? `<button class="btn cash-btn" data-cashout="${esc(w.id)}">Cash out</button>` : ""}</div><div class="amt num">${right}</div></div>`;
   }).join("")}</div>`;
 }
 
@@ -998,9 +1001,10 @@ async function settingsAction(t) {
 function profileHTML() {
   const me = userOf(uid()) || { username: "", balance: 0 };
   const mine = state.wagers.filter(w => w.user_id === uid());
-  const settled = mine.filter(w => w.payout != null && betById(w.bet_id)?.status === "settled");
+  const settled = mine.filter(w => w.payout != null && betById(w.bet_id)?.status === "settled" && !w.cashed_out_at);
   const won = settled.filter(w => w.payout > w.stake), lost = settled.filter(w => w.payout === 0);
-  const profit = settled.reduce((a, w) => a + (w.payout - w.stake), 0);
+  const cashed = mine.filter(w => w.cashed_out_at);
+  const profit = [...settled, ...cashed].reduce((a, w) => a + (w.payout - w.stake), 0);
   const best = won.reduce((m, w) => Math.max(m, w.payout - w.stake), 0);
   const staked = mine.reduce((a, w) => a + w.stake, 0);
   const posted = state.bets.filter(b => b.creator_id === uid()).length;
@@ -1117,6 +1121,39 @@ function goToBet(id) {
     el?.scrollIntoView({ behavior: "smooth", block: "center" });
     el?.classList.add("flash"); setTimeout(() => el?.classList.remove("flash"), 1600);
   }, 80);
+}
+
+const betTitle = b => { const pr = propOf(b); return pr ? `${usernameOf(pr.player_id)} · ${pr.stat}` : b.title; };
+
+async function openCashOut(wagerId) {
+  const w = state.wagers.find(x => x.id === wagerId); if (!w) return;
+  const b = betById(w.bet_id), o = b?.outcomes.find(x => x.id === w.outcome_id);
+  const pick = w.line != null ? `${sideLabel(w.side)} ${Number(w.line)}` : o?.label || "Your pick";
+  sheet(`<h4>Cash out · ${esc(b ? betTitle(b) : "Bet")}</h4><b>${esc(pick)} <span class="num">${fmtOdds(w.odds)}</span></b>
+    <div class="cash-quote"><small>Getting the price…</small></div>
+    <div class="err" id="co-err"></div>
+    <button class="btn primary big" id="co-go" disabled>Cash out</button>
+    <button class="btn big" data-close>Keep my bet</button>`);
+  const { data: q, error } = await sb.rpc("cash_out_quote", { p_wager: wagerId });
+  if (error) { $("#co-err").textContent = errMsg(error); $(".cash-quote").innerHTML = ""; return; }
+  const net = q.value - q.stake;
+  $(".cash-quote").innerHTML = `<div><small>You get</small><b class="num">${fmtTok(q.value)}</b>
+      <span class="num ${net > 0 ? "pos" : net < 0 ? "neg" : ""}">${net === 0 ? "your stake back" : `${net > 0 ? "+" : "−"}${fmtTok(Math.abs(net))} vs your ${fmtTok(q.stake)} stake`}</span></div>
+    <div><small>If you hold and win</small><b class="num">${fmtTok(q.return)}</b></div>
+    ${q.grace ? `<p class="hint">You just placed this, so you get your full stake back.</p>` : `<p class="hint">Based on the current odds. Once you cash out, this bet is done for you.</p>`}`;
+  $("#co-go").disabled = false;
+  $("#co-go").textContent = `Cash out ${fmtTok(q.value)}`;
+  $("#co-go").onclick = async () => {
+    $("#co-go").disabled = true;
+    const { data: got, error } = await sb.rpc("cash_out", { p_wager: wagerId, p_expected: q.value });
+    if (error) {
+      const m = errMsg(error);
+      $("#co-err").textContent = m; $("#co-go").disabled = false;
+      if (m.startsWith("Cash out value changed")) setTimeout(() => openCashOut(wagerId), 900);
+      return;
+    }
+    closeSheet(); toast(`Cashed out ${fmtTok(got)} tokens`); loadGroupData();
+  };
 }
 
 /* ---------------- notifications ---------------- */
@@ -1353,6 +1390,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.pfPlayer !== undefined) { state.propPlayer = t.dataset.pfPlayer; return render(); }
   if (t.dataset.postStat) return openPostSlate(t.dataset.postStat, t.dataset.postOnly || "");
   if (t.dataset.gotoBet) return goToBet(t.dataset.gotoBet);
+  if (t.dataset.cashout) return openCashOut(t.dataset.cashout);
   if (t.dataset.toggleProp) {
     const id = t.dataset.toggleProp;
     state.openProps.has(id) ? state.openProps.delete(id) : state.openProps.add(id);

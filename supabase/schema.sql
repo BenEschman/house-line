@@ -1614,3 +1614,5 @@ alter publication supabase_realtime add table public.profiles;
 -- To set up a new project: run those, enable pg_net, create the three vault secrets with
 -- vault.create_secret(...) using a fresh VAPID key pair (npx web-push generate-vapid-keys),
 -- put the new public key in app.js (VAPID_PUBLIC), and deploy supabase/functions/push.
+-- Cash out: see the project migration "cash_out" (wagers.cashed_out_at, cash_out_quote, cash_out,
+-- pricing that ignores cashed-out wagers, and settle/void skipping them).
