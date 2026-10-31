@@ -6,7 +6,7 @@ const configured = cfg.supabaseUrl && !cfg.supabaseUrl.includes("YOUR-PROJECT") 
 const sb = configured ? window.supabase.createClient(cfg.supabaseUrl, cfg.supabaseAnonKey) : null;
 
 const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdds: "-110", underOdds: "-110",
-  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [], closesAt: "", startsAt: "" });
+  outcomes: [{ label: "", odds: "+100" }, { label: "", odds: "+100" }], hidden: [], closesAt: "", startsAt: "", yesOdds: "+100", noOdds: "-120", about: "" });
 
 const state = {
   session: null, groups: [], groupId: null,
@@ -209,6 +209,7 @@ function avatarHTML(id, size = 34) {
 const nameOf = id => id === uid() ? "You" : (state.members.find(m => m.id === id)?.username || "player");
 const betById = id => state.bets.find(b => b.id === id);
 const propOf = b => b.prop_id ? state.props.find(p => p.id === b.prop_id) : null;
+const canSettle = b => propOf(b)?.player_id !== uid() && b.about_id !== uid();
 const canManage = b => propOf(b)?.player_id !== uid() && (b.creator_id === uid() || group()?.owner_id === uid());
 
 function myStats() {
@@ -362,7 +363,9 @@ function betCard(b) {
     </button>`;
   }).join("");
   const live = b.status === "open" || b.status === "locked";
-  const ctl = live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
+  const settleOnly = live && !canManage(b) && canSettle(b);
+  const ctl = settleOnly ? `<div class="ctl"><span>Know how it ended?</span><button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button></div>`
+    : live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
       ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live count</button>` : ""}
       <button class="btn" data-act="closetime" data-bet="${esc(b.id)}">End time</button>
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
@@ -374,7 +377,9 @@ function betCard(b) {
       <h3>${esc(prop ? `${usernameOf(prop.player_id)} · ${prop.stat}` : b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
       ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Ended ${esc(fmtClose(b.closes_at))} · waiting for ${esc(b.creator_id === uid() ? "you" : nameOf(b.creator_id))} to settle` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
+      ${b.about_id ? `<p class="note">${b.about_id === uid() ? "About you. Someone else settles it." : `About ${esc(nameOf(b.about_id))}`}</p>` : ""}
       ${b.final_value != null ? `<p class="note"><b>Final: ${esc(String(Number(b.final_value)))}</b></p>` : ""}
+      ${b.status === "settled" && b.settled_by ? `<p class="note">Settled by ${esc(nameOf(b.settled_by))}</p>` : ""}
       ${canBet && b.line != null ? `<p class="note">Tap odds to bet, or pick your own line.</p>` : ""}
       ${prop && state.tab !== "props" ? `<p class="note prop-note"><span class="prop-tag">PROP</span>${esc(nameOf(prop.player_id))} · ${esc(prop.stat)}${b.auto_line ? ` <span class="alt-tag">auto line</span>` : ""}</p>` : ""}
       ${myProp && open ? `<p class="note">This prop is about you, so you can't bet on it.</p>` : ""}
@@ -413,9 +418,14 @@ function liveBar(b, live) {
 
 function createHTML() {
   const d = state.draft, ou = d.type === "ou";
-  const typeSeg = `<div class="seg" role="group" aria-label="Bet type">${[["ou", "Over / Under"], ["custom", "Custom outcomes"]]
+  const typeSeg = `<div class="seg" role="group" aria-label="Bet type">${[["ou", "Over / Under"], ["yesno", "Yes / No"], ["custom", "Custom"]]
     .map(([k, l]) => `<button type="button" data-type="${k}" aria-pressed="${d.type === k}">${l}</button>`).join("")}</div>`;
-  const body = ou ? `
+  const body = d.type === "yesno" ? `
+    <div class="orow two">
+      <label class="f" for="c-yes">Yes odds${oddsField("c-yes", d.yesOdds)}</label>
+      <label class="f" for="c-no">No odds${oddsField("c-no", d.noOdds)}</label>
+    </div>
+    <span class="hint">Make the likelier side the minus side. Tap ± to switch minus and plus.</span>` : ou ? `
     <label class="f" for="c-line">Line<input class="inp num" id="c-line" inputmode="decimal" placeholder="12.5" value="${esc(d.line)}"><span class="hint">Use a .5 so nobody pushes.</span></label>
     <div class="orow two">
       <label class="f" for="c-over">Over odds${oddsField("c-over", d.overOdds)}</label>
@@ -433,15 +443,26 @@ function createHTML() {
     </div>`;
   return `<h2>Post a line</h2>${typeSeg}
   <form class="form" id="createForm">
-    <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
+    <label class="f" for="c-title">What’s the bet?<input class="inp" id="c-title" maxlength="120" placeholder="${ou ? "Minutes for Jake to finish the burrito" : d.type === "yesno" ? "Does Jake text his ex tonight?" : "Who wins Friday’s Smash bracket?"}" value="${esc(d.title)}"></label>
     <label class="f" for="c-detail">Details (optional)<input class="inp" id="c-detail" maxlength="240" placeholder="Settled by stopwatch at the table" value="${esc(d.detail)}"></label>
     ${body}
     <div class="f">Starts${startPicker(state.draft.startsAt)}<span class="hint">Odds hold at your opening line until the start. People can bet early.</span></div>
     <div class="f">Ends${closePicker("c", state.draft.closesAt)}<span class="hint">Betting closes at the end. Over/under odds follow the clock between start and end.</span></div>
+    ${aboutPicker()}
     ${hidePicker()}
     <div class="err" id="c-err"></div>
     <button class="btn primary big" type="submit">Post bet</button>
   </form>`;
+}
+
+function aboutPicker() {
+  const people = [...state.members].sort((a, b) => a.username.localeCompare(b.username));
+  if (people.length < 2) return "";
+  const a = state.draft.about;
+  return `<div class="f">Who's it about? (optional)
+    <div class="chips hide-chips about-chips">${people.map(m => `<button type="button" data-about="${esc(m.id)}" aria-pressed="${a === m.id}">${esc(m.id === uid() ? "Me" : m.username)}</button>`).join("")}</div>
+    <span class="hint">${a ? `${esc(a === uid() ? "You" : usernameOf(a))} can't settle this one. Anyone else in the group can.` : "Anyone in the group can settle a line. Whoever it's about can't."}</span>
+  </div>`;
 }
 
 function hidePicker() {
@@ -1346,6 +1367,8 @@ function syncDraft() {
   for (const [id, key] of [["c-title", "title"], ["c-detail", "detail"], ["c-line", "line"]])
     if (v(id) !== undefined) d[key] = v(id);
   if (oddsValue("c-over") !== undefined) d.overOdds = oddsValue("c-over");
+  if (oddsValue("c-yes") !== undefined) d.yesOdds = oddsValue("c-yes");
+  if (oddsValue("c-no") !== undefined) d.noOdds = oddsValue("c-no");
   if (oddsValue("c-under") !== undefined) d.underOdds = oddsValue("c-under");
   if (document.getElementById("c-at")) d.closesAt = document.getElementById("c-at").value;
   if (document.getElementById("c-start")) d.startsAt = document.getElementById("c-start").value;
@@ -1406,6 +1429,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.filter) { state.filter = t.dataset.filter; return render(); }
   if (t.dataset.startPreset === "c") { syncDraft(); state.draft.startsAt = t.dataset.v; return render(); }
   if (t.dataset.closePreset === "c") { syncDraft(); state.draft.closesAt = t.dataset.v; return render(); }
+  if (t.dataset.about) { syncDraft(); state.draft.about = state.draft.about === t.dataset.about ? "" : t.dataset.about; return render(); }
   if (t.dataset.hide) {
     syncDraft();
     const h = state.draft.hidden, id = t.dataset.hide;
@@ -1478,6 +1502,10 @@ document.addEventListener("submit", async e => {
       if (!validOdds(ov) || !validOdds(un)) return (err.textContent = "Odds need at least 100 (like −110 or +120). Tap ± to switch minus and plus.");
       line = L;
       outcomes = [{ label: `Over ${L}`, odds: ov }, { label: `Under ${L}`, odds: un }];
+    } else if (d.type === "yesno") {
+      const y = Number(d.yesOdds), n = Number(d.noOdds);
+      if (!validOdds(y) || !validOdds(n)) return (err.textContent = "Odds need at least 100 (like −150 or +130). Tap ± to switch minus and plus.");
+      outcomes = [{ label: "Yes", odds: y }, { label: "No", odds: n }];
     } else {
       outcomes = d.outcomes.map(o => ({ label: o.label.trim(), odds: Number(o.odds) }));
       if (outcomes.some(o => !o.label)) return (err.textContent = "Every outcome needs a name.");
@@ -1486,7 +1514,11 @@ document.addEventListener("submit", async e => {
     if (d.closesAt && new Date(d.closesAt) <= new Date()) return (err.textContent = "Pick an end time in the future.");
     if (d.startsAt && d.closesAt && new Date(d.startsAt) >= new Date(d.closesAt)) return (err.textContent = "The end has to be after the start.");
     busy(true);
-    const { error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden, p_closes_at: d.closesAt ? new Date(d.closesAt).toISOString() : null, p_starts_at: d.startsAt ? new Date(d.startsAt).toISOString() : null });
+    const { data: newId, error } = await sb.rpc("create_bet", { p_group: state.groupId, p_title: title, p_detail: d.detail.trim(), p_line: line, p_outcomes: outcomes, p_hidden: d.hidden, p_closes_at: d.closesAt ? new Date(d.closesAt).toISOString() : null, p_starts_at: d.startsAt ? new Date(d.startsAt).toISOString() : null });
+    if (!error && d.about) {
+      const r = await sb.rpc("set_bet_about", { p_bet: newId, p_about: d.about });
+      if (r.error) toast("Posted, but couldn't save who it's about: " + errMsg(r.error));
+    }
     busy(false);
     if (error) return (err.textContent = errMsg(error));
     state.draft = { ...blankDraft(), type: d.type };

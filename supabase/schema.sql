@@ -1616,3 +1616,5 @@ alter publication supabase_realtime add table public.profiles;
 -- put the new public key in app.js (VAPID_PUBLIC), and deploy supabase/functions/push.
 -- Cash out: see the project migration "cash_out" (wagers.cashed_out_at, cash_out_quote, cash_out,
 -- pricing that ignores cashed-out wagers, and settle/void skipping them).
+-- Anyone settles (except who it's about), bets.about_id / settled_by, set_bet_about:
+-- see the project migration "anyone_settles_and_about".
