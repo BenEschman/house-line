@@ -1619,3 +1619,5 @@ alter publication supabase_realtime add table public.profiles;
 -- Anyone settles (except who it's about), bets.about_id / settled_by, set_bet_about:
 -- see the project migration "anyone_settles_and_about".
 -- Editing bets: see the project migration "edit_bet" (bets.edited_at, public.edit_bet).
+-- Photo-proof count updates + live count notifications: see migrations "self_count_with_photo",
+-- "live_count_notifications", "live_count_notifications_fix", "fix_is_subject_null".

@@ -403,3 +403,16 @@ details.day[open] > .list{padding-bottom:6px}
 .lock-note{background:var(--chip-soft);border-radius:10px;padding:10px 12px;margin:0;color:var(--ink)}
 .ed-label{font-weight:600;align-self:center}
 .inp:disabled{opacity:.55}
+
+/* photo proof */
+.proof-link{flex-basis:100%;margin-top:6px;border:0;background:none;padding:0;text-align:left;font-size:12px;font-weight:600;color:var(--felt)}
+.proof-shot{border:1.5px dashed var(--line);border-radius:12px;padding:16px;display:flex;flex-direction:column;align-items:center;gap:4px;cursor:pointer;text-align:center;background:var(--bg)}
+.proof-shot span{font-size:28px}
+.proof-shot small{font-size:12px;color:var(--muted)}
+.proof-shot img{max-height:240px;border-radius:10px;object-fit:cover}
+.proof-list{display:flex;flex-direction:column;gap:12px;max-height:60vh;overflow-y:auto}
+.proof-item{display:flex;flex-direction:column;gap:6px}
+.proof-item img{width:100%;border-radius:12px;max-height:340px;object-fit:cover}
+.proof-item b{font-family:var(--display);font-size:22px}
+.proof-item span{font-size:13px;color:var(--muted)}
+.note-icon.live{color:var(--loss)}

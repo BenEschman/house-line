@@ -160,12 +160,13 @@ async function openGroup(id) {
 
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
-  const [bets, wagers, members, hidden, props] = await Promise.all([
+  const [bets, wagers, members, hidden, props, counts] = await Promise.all([
     sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username, avatar)").eq("group_id", gid),
     sb.from("bet_hidden").select("bet_id, user_id").eq("group_id", gid),
     sb.from("props").select("*").eq("group_id", gid).order("created_at"),
+    sb.from("count_updates").select("id, bet_id, user_id, value, has_photo, created_at").eq("group_id", gid).order("created_at", { ascending: false }).limit(500),
   ]);
   if (gid !== state.groupId) return;
   const err = bets.error || wagers.error || members.error;
@@ -174,6 +175,7 @@ async function loadGroupData() {
   state.wagers = wagers.data || [];
   state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player", avatar: m.profiles?.avatar || null }));
   state.props = props.data || [];
+  state.counts = counts?.data || [];
   state.hidden = {};
   for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
   state.loaded = true;
@@ -187,7 +189,7 @@ function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(
 function subscribe(gid) {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel("group-" + gid);
-  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props", "profiles"])
+  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props", "profiles", "count_updates"])
     ch.on("postgres_changes", table === "profiles" ? { event: "*", schema: "public", table } : { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
   ch.subscribe();
   state.channel = ch;
@@ -209,6 +211,7 @@ function avatarHTML(id, size = 34) {
 const nameOf = id => id === uid() ? "You" : (state.members.find(m => m.id === id)?.username || "player");
 const betById = id => state.bets.find(b => b.id === id);
 const propOf = b => b.prop_id ? state.props.find(p => p.id === b.prop_id) : null;
+const isSubject = b => propOf(b)?.player_id === uid() || b.about_id === uid();
 const canSettle = b => propOf(b)?.player_id !== uid() && b.about_id !== uid();
 const canManage = b => propOf(b)?.player_id !== uid() && (b.creator_id === uid() || group()?.owner_id === uid());
 
@@ -364,7 +367,9 @@ function betCard(b) {
   }).join("");
   const live = b.status === "open" || b.status === "locked";
   const settleOnly = live && !canManage(b) && canSettle(b);
-  const ctl = settleOnly ? `<div class="ctl"><span>Know how it ended?</span><button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button></div>`
+  const selfCount = live && b.line != null && isSubject(b);
+  const ctl = selfCount && !canManage(b) ? `<div class="ctl"><span>This line is about you</span><button class="btn live-btn" data-act="selfcount" data-bet="${esc(b.id)}">📷 Update my count</button></div>`
+    : settleOnly ? `<div class="ctl"><span>Know how it ended?</span><button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button></div>`
     : live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
       ${b.creator_id === uid() ? `<button class="btn" data-act="edit" data-bet="${esc(b.id)}">Edit</button>` : ""}
       ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live count</button>` : ""}
@@ -413,8 +418,10 @@ function liveBar(b, live) {
   if (b.line == null || !b.closes_at || !live) return "";
   if (!hasStarted(b)) return `<div class="livebar"><span class="dot off"></span>Starts&nbsp;<b>${esc(fmtClose(b.starts_at || b.created_at))}</b><span class="when">odds frozen until then</span></div>`;
   const pct = Math.round(progressAt(b) * 100);
+  const log = (state.counts || []).filter(c => c.bet_id === b.id), last = log[0], photos = log.filter(c => c.has_photo).length;
   return `<div class="livebar"><span class="dot"></span><b class="num">${esc(String(Number(b.live_current ?? 0)))}</b>&nbsp;so far · <span class="num">${pct}%</span>&nbsp;through${b.live_updated_at ? `<span class="when">count ${agoText(b.live_updated_at)}</span>` : ""}
-    <div class="prog" aria-hidden="true"><i style="width:${pct}%"></i></div></div>`;
+    <div class="prog" aria-hidden="true"><i style="width:${pct}%"></i></div>
+    ${last ? `<button class="proof-link" data-proof="${esc(b.id)}">${last.has_photo ? "📷 " : ""}Updated by ${esc(nameOf(last.user_id))}${photos ? ` · ${photos} ${photos === 1 ? "photo" : "photos"}` : ""} · history ›</button>` : ""}</div>`;
 }
 
 function createHTML() {
@@ -762,6 +769,7 @@ function openWager(betId, outId) {
 
 function openLive(betId) {
   const b = betById(betId); if (!b) return;
+  if (isSubject(b)) return openSelfCount(betId);
   const line = Number(b.line);
   if (!b.closes_at) return toast("Give this bet an end time first (End time button) so the odds can follow the clock.");
   if (!hasStarted(b)) return toast(`This starts ${fmtClose(b.starts_at || b.created_at)}. Count updates open then.`);
@@ -870,6 +878,74 @@ function openEdit(betId) {
     if (error) { err.textContent = errMsg(error); $("#ed-save").disabled = false; return; }
     closeSheet(); toast("Bet updated"); loadGroupData();
   };
+}
+
+// Resize a proof photo to at most 1024px on the long side, small enough to store and load quickly.
+function resizeProof(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file), img = new Image();
+    img.onload = () => {
+      const scale = Math.min(1, 1024 / Math.max(img.naturalWidth, img.naturalHeight));
+      const c = document.createElement("canvas");
+      c.width = Math.round(img.naturalWidth * scale); c.height = Math.round(img.naturalHeight * scale);
+      c.getContext("2d").drawImage(img, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(url);
+      let q = 0.8, data = c.toDataURL("image/jpeg", q);
+      while (data.length > 380000 && q > 0.35) { q -= 0.1; data = c.toDataURL("image/jpeg", q); }
+      resolve(data);
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("That photo couldn't be read. Try taking it again.")); };
+    img.src = url;
+  });
+}
+
+function openSelfCount(betId) {
+  const b = betById(betId); if (!b) return;
+  if (!b.closes_at) return toast("This line needs an end time before counts can be updated.");
+  if (!hasStarted(b)) return toast(`This starts ${fmtClose(b.starts_at || b.created_at)}. Count updates open then.`);
+  let photo = null;
+  sheet(`<h4>Update my count · ${esc(betTitle(b))}</h4>
+    <div class="f">Count so far · line ${esc(String(Number(b.line)))}
+      <div class="stepper"><button type="button" id="sc-minus" aria-label="Decrease count">−</button>
+        <input class="inp num" id="sc-cur" inputmode="decimal" value="${Number(b.live_current ?? 0) + 1}">
+        <button type="button" id="sc-plus" aria-label="Increase count">+</button></div></div>
+    <div class="proof-shot" id="sc-shot"><span>📷</span><b>Take a photo as proof</b><small>Everyone in the group can see it.</small></div>
+    <input type="file" id="sc-file" accept="image/*" capture="environment" hidden>
+    <div class="err" id="sc-err"></div>
+    <button class="btn primary big" id="sc-save" disabled>Update count</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  const cur = $("#sc-cur");
+  $("#sc-minus").onclick = () => { cur.value = Math.max(0, (Number(cur.value) || 0) - 1); };
+  $("#sc-plus").onclick = () => { cur.value = (Number(cur.value) || 0) + 1; };
+  $("#sc-shot").onclick = () => $("#sc-file").click();
+  $("#sc-file").onchange = async e => {
+    const f = e.target.files?.[0]; if (!f) return;
+    try {
+      photo = await resizeProof(f);
+      $("#sc-shot").innerHTML = `<img src="${photo}" alt="Your proof photo"><small>Tap to retake</small>`;
+      $("#sc-save").disabled = false;
+    } catch (er) { $("#sc-err").textContent = er.message; }
+  };
+  $("#sc-save").onclick = async () => {
+    const v = Number(cur.value);
+    if (!Number.isFinite(v) || v < 0) return ($("#sc-err").textContent = "Enter your count.");
+    if (!photo) return ($("#sc-err").textContent = "Take a photo first.");
+    $("#sc-save").disabled = true;
+    const { error } = await sb.rpc("update_own_count", { p_bet: b.id, p_current: v, p_photo: photo });
+    if (error) { $("#sc-err").textContent = errMsg(error); $("#sc-save").disabled = false; return; }
+    closeSheet(); toast(`Count updated to ${v}`); loadGroupData();
+  };
+}
+
+async function openProof(betId) {
+  const b = betById(betId); if (!b) return;
+  sheet(`<h4>Count history · ${esc(betTitle(b))}</h4><div class="proof-list"><small>Loading…</small></div><button class="btn big" data-close>Close</button>`);
+  const { data, error } = await sb.from("count_updates").select("id, user_id, value, photo, created_at").eq("bet_id", betId).order("created_at", { ascending: false }).limit(30);
+  if (error) return ($(".proof-list").textContent = errMsg(error));
+  $(".proof-list").innerHTML = (data || []).map(c => `<div class="proof-item">
+      ${c.photo ? `<img src="${esc(c.photo)}" alt="Proof photo from ${esc(nameOf(c.user_id))}" loading="lazy">` : ""}
+      <div><b class="num">${esc(String(Number(c.value)))}</b> <span>by ${esc(nameOf(c.user_id))} · ${agoText(c.created_at)}${c.photo ? "" : " · no photo"}</span></div>
+    </div>`).join("") || `<small>No updates yet.</small>`;
 }
 
 function openCloseTime(betId) {
@@ -1250,6 +1326,7 @@ async function openCashOut(wagerId) {
 
 const VAPID_PUBLIC = "BGewTeQH_00NJL5k1zEEzQB8dMu5sEcmr4jb4ycVOyR4OSOeqpnAkpDpd4o1IMIEyw5IrtxbQKC9c6Gxi5gIpEA";
 const NOTIFY_KINDS = [
+  ["live", "Live counts", "Count updates on bets you're in. One notification per bet that updates in place."],
   ["new_line", "New lines", "When someone posts a line in your group"],
   ["result", "Results", "When a bet you're in settles or is voided"],
   ["action", "Bets on my lines", "When someone bets on a line you posted"],
@@ -1257,6 +1334,7 @@ const NOTIFY_KINDS = [
   ["joined", "New members", "When someone joins a group you own"],
 ];
 const KIND_ICON = {
+  live: '<circle cx="12" cy="12" r="3"/><path d="M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/>',
   result: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/>',
   new_line: '<path d="M12 5v14M5 12h14"/>',
   action: '<circle cx="12" cy="12" r="8"/><path d="M12 8v8M9.5 10.5c0-1 1-1.5 2.5-1.5s2.5.6 2.5 1.5-1 1.3-2.5 1.5-2.5.6-2.5 1.5 1 1.5 2.5 1.5 2.5-.5 2.5-1.5"/>',
@@ -1513,6 +1591,8 @@ document.addEventListener("click", async e => {
   if (t.dataset.act === "live") return openLive(t.dataset.bet);
   if (t.dataset.act === "closetime") return openCloseTime(t.dataset.bet);
   if (t.dataset.act === "edit") return openEdit(t.dataset.bet);
+  if (t.dataset.act === "selfcount") return openSelfCount(t.dataset.bet);
+  if (t.dataset.proof) return openProof(t.dataset.proof);
   if (t.dataset.act === "void") return openVoid(t.dataset.bet);
   if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
     const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });
