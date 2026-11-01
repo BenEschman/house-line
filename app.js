@@ -366,6 +366,7 @@ function betCard(b) {
   const settleOnly = live && !canManage(b) && canSettle(b);
   const ctl = settleOnly ? `<div class="ctl"><span>Know how it ended?</span><button class="btn primary" data-act="settle" data-bet="${esc(b.id)}">Settle</button></div>`
     : live && canManage(b) ? `<div class="ctl"><span>${b.creator_id === uid() ? "Your bet" : "Group owner"}</span>
+      ${b.creator_id === uid() ? `<button class="btn" data-act="edit" data-bet="${esc(b.id)}">Edit</button>` : ""}
       ${b.line != null ? `<button class="btn live-btn" data-act="live" data-bet="${esc(b.id)}">Live count</button>` : ""}
       <button class="btn" data-act="closetime" data-bet="${esc(b.id)}">End time</button>
       ${open ? `<button class="btn" data-act="lock" data-bet="${esc(b.id)}">Lock</button>` : `<button class="btn" data-act="reopen" data-bet="${esc(b.id)}">Reopen</button>`}
@@ -373,7 +374,7 @@ function betCard(b) {
       <button class="btn danger" data-act="void" data-bet="${esc(b.id)}">Void</button></div>` : "";
   return `<article class="bet" data-bet-card="${esc(b.id)}">
     <div class="bet-head">
-      <div class="bet-meta">${avatarHTML(b.creator_id, 18)}<span>${b.starts_at ? `<b class="start-time">${esc(betStart(b).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</b> · ` : ""}${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
+      <div class="bet-meta">${avatarHTML(b.creator_id, 18)}<span>${b.starts_at ? `<b class="start-time">${esc(betStart(b).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }))}</b> · ` : ""}${esc(nameOf(b.creator_id))}${b.line != null ? ` · line ${esc(b.line)}` : ""}${b.edited_at ? " · edited" : ""}</span><span class="pill ${esc(b.status)}">${esc(b.status)}</span></div>
       <h3>${esc(prop ? `${usernameOf(prop.player_id)} · ${prop.stat}` : b.title)}</h3>
       ${b.detail ? `<p class="detail">${esc(b.detail)}</p>` : ""}
       ${b.closes_at && (open || (b.status === "locked" && closed)) ? `<p class="note close-note${closed ? "" : " ticking"}"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>${closed ? `Ended ${esc(fmtClose(b.closes_at))} · waiting for ${esc(b.creator_id === uid() ? "you" : nameOf(b.creator_id))} to settle` : `Ends ${esc(fmtClose(b.closes_at))} · ${leftText(b.closes_at)}`}</p>` : ""}
@@ -800,6 +801,74 @@ function openLive(betId) {
     closeSheet();
     toast(data?.status === "locked" && b.status === "open" ? "Over has hit, so the bet is locked. Settle it when ready." : "Count updated");
     loadGroupData();
+  };
+}
+
+function openEdit(betId) {
+  const b = betById(betId); if (!b) return;
+  const wagers = state.wagers.filter(w => w.bet_id === b.id).length;
+  const locked = wagers > 0, prop = !!b.prop_id, started = Date.now() >= betStart(b).getTime();
+  const canOdds = !locked && !b.auto_line, isOU = b.line != null, isCustom = !isOU && !prop;
+  const startVal = b.starts_at && !started ? toLocalInput(new Date(b.starts_at)) : "";
+  const endVal = b.closes_at ? toLocalInput(new Date(b.closes_at)) : "";
+  const others = state.members.filter(m => m.id !== uid() || true).sort((x, y) => x.username.localeCompare(y.username));
+  let about = b.about_id || "";
+  sheet(`<h4>Edit bet</h4><b>${esc(betTitle(b))}</b>
+    ${locked ? `<p class="hint lock-note">${wagers} ${wagers === 1 ? "bet is" : "bets are"} already on this, so the title, line, and odds are locked. You can still clarify the details and change the times.</p>` : ""}
+    ${!prop ? `<label class="f" for="ed-title">What’s the bet?<input class="inp" id="ed-title" maxlength="120" value="${esc(b.title)}" ${locked ? "disabled" : ""}></label>` : ""}
+    <label class="f" for="ed-detail">Details<input class="inp" id="ed-detail" maxlength="240" value="${esc(b.detail || "")}" placeholder="How it gets settled, what counts"></label>
+    ${isOU ? `<label class="f" for="ed-line">Line<input class="inp num" id="ed-line" inputmode="decimal" value="${esc(String(Number(b.line)))}" ${canOdds ? "" : "disabled"}></label>` : ""}
+    ${canOdds ? `<div class="f">Odds<div class="list" style="gap:8px">${b.outcomes.map(o => `
+      <div class="orow ${isCustom ? "" : "two"}">
+        ${isCustom ? `<input class="inp" id="ed-ol-${esc(o.id)}" maxlength="60" value="${esc(o.label)}" aria-label="Outcome name">` : `<span class="ed-label">${esc(isOU ? (o.position === 0 ? "Over" : "Under") : o.label)}</span>`}
+        ${oddsField(`ed-oo-${o.id}`, fmtOdds(o.open_odds ?? o.odds))}
+      </div>`).join("")}</div></div>` : ""}
+    ${!started ? `<div class="f">Starts${sheetTimePicker("ed-start", startPresets(), startVal, "Start date and time")}</div>` : ""}
+    <div class="f">Ends${sheetTimePicker("ed-end", closePresets(), endVal, "End date and time")}</div>
+    ${!prop && !locked ? `<div class="f">Who's it about?<div class="chips hide-chips">${others.map(m =>
+      `<button type="button" data-ed-about="${esc(m.id)}" aria-pressed="${about === m.id}">${esc(m.id === uid() ? "Me" : m.username)}</button>`).join("")}</div></div>` : ""}
+    <div class="err" id="ed-err"></div>
+    <button class="btn primary big" id="ed-save">Save changes</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  wireSheetTimePickers();
+  document.querySelectorAll("[data-ed-about]").forEach(btn => btn.onclick = () => {
+    about = about === btn.dataset.edAbout ? "" : btn.dataset.edAbout;
+    document.querySelectorAll("[data-ed-about]").forEach(x => x.setAttribute("aria-pressed", String(x.dataset.edAbout === about)));
+  });
+  $("#ed-save").onclick = async () => {
+    const err = $("#ed-err"), ch = {};
+    const title = $("#ed-title")?.value.trim();
+    if (title !== undefined && !locked && title !== b.title) { if (!title) return (err.textContent = "Give the bet a name."); ch.title = title; }
+    const detail = $("#ed-detail").value.trim();
+    if (detail !== (b.detail || "")) ch.detail = detail;
+    if (isOU && canOdds) {
+      const lv = $("#ed-line").value.trim(), L = Number(lv);
+      if (lv === "" || !Number.isFinite(L) || L < 0) return (err.textContent = "Set a number for the line, like 3.5.");
+      if (L !== Number(b.line)) ch.line = L;
+    }
+    if (canOdds) {
+      const outs = [];
+      for (const o of b.outcomes) {
+        const od = Number(oddsValue(`ed-oo-${o.id}`));
+        if (!validOdds(od)) return (err.textContent = "Odds need at least 100 (like −110 or +120). Tap ± to switch minus and plus.");
+        const label = isCustom ? $(`#ed-ol-${o.id}`).value.trim() : o.label;
+        if (isCustom && !label) return (err.textContent = "Every outcome needs a name.");
+        if (od !== (o.open_odds ?? o.odds) || label !== o.label) outs.push({ id: o.id, odds: od, label });
+      }
+      if (outs.length) ch.outcomes = b.outcomes.map(o => outs.find(x => x.id === o.id) || { id: o.id, odds: o.open_odds ?? o.odds, label: o.label });
+    }
+    if (!started) {
+      const sv = $("#ed-start").value;
+      if (sv !== startVal) ch.starts_at = sv ? new Date(sv).toISOString() : null;
+    }
+    const ev = $("#ed-end").value;
+    if (ev !== endVal) ch.closes_at = ev ? new Date(ev).toISOString() : null;
+    if (!prop && !locked && about !== (b.about_id || "")) ch.about = about || null;
+    if (!Object.keys(ch).length) return closeSheet();
+    $("#ed-save").disabled = true;
+    const { error } = await sb.rpc("edit_bet", { p_bet: b.id, p_changes: ch });
+    if (error) { err.textContent = errMsg(error); $("#ed-save").disabled = false; return; }
+    closeSheet(); toast("Bet updated"); loadGroupData();
   };
 }
 
@@ -1443,6 +1512,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.act === "settle") return openSettle(t.dataset.bet);
   if (t.dataset.act === "live") return openLive(t.dataset.bet);
   if (t.dataset.act === "closetime") return openCloseTime(t.dataset.bet);
+  if (t.dataset.act === "edit") return openEdit(t.dataset.bet);
   if (t.dataset.act === "void") return openVoid(t.dataset.bet);
   if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
     const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });

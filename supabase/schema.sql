@@ -1618,3 +1618,4 @@ alter publication supabase_realtime add table public.profiles;
 -- pricing that ignores cashed-out wagers, and settle/void skipping them).
 -- Anyone settles (except who it's about), bets.about_id / settled_by, set_bet_about:
 -- see the project migration "anyone_settles_and_about".
+-- Editing bets: see the project migration "edit_bet" (bets.edited_at, public.edit_bet).

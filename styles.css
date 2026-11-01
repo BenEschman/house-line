@@ -398,3 +398,8 @@ details.day[open] > .list{padding-bottom:6px}
 .cash-quote > div:first-child b{color:var(--felt)}
 .cash-quote span{font-size:12px;font-weight:600}
 .cash-quote .hint{grid-column:1/-1;margin:0}
+
+/* edit bet */
+.lock-note{background:var(--chip-soft);border-radius:10px;padding:10px 12px;margin:0;color:var(--ink)}
+.ed-label{font-weight:600;align-self:center}
+.inp:disabled{opacity:.55}
