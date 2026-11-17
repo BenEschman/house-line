@@ -11,7 +11,7 @@ const blankDraft = () => ({ type: "ou", title: "", detail: "", line: "", overOdd
 const state = {
   session: null, groups: [], groupId: null,
   bets: [], wagers: [], members: [], hidden: {}, props: [], propStat: "", propPlayer: "", loaded: false,
-  tab: "board", filter: "open", authMode: "signin", draft: blankDraft(), channel: null,
+  tab: "board", filter: "open", authMode: /[?&]join=/.test(location.search) ? "signup" : "signin", draft: blankDraft(), channel: null,
 };
 
 const $ = s => document.querySelector(s);
@@ -139,9 +139,45 @@ function toast(msg) {
 }
 const errMsg = e => (e?.message || "Something went wrong. Try again.").replace(/^.*?ERROR:\s*/, "");
 
+/* ---------------- invite links ---------------- */
+
+const inviteLink = code => `${location.origin}${location.pathname}?join=${encodeURIComponent(code)}`;
+let pendingJoin = (() => {
+  const q = new URLSearchParams(location.search).get("join");
+  if (q && /^[A-Za-z0-9]{6}$/.test(q)) {
+    store.set("hl-join", q.toUpperCase());
+    history.replaceState(null, "", location.pathname);
+  }
+  return store.get("hl-join") || "";
+})();
+state.invite = null;   // { name, members, owner } for the pending code
+if (pendingJoin && sb) sb.rpc("group_preview", { p_code: pendingJoin }).then(({ data }) => {
+  state.invite = data || { bad: true };
+  if (!state.session) render();
+});
+async function usePendingJoin() {
+  if (!pendingJoin) return false;
+  const code = pendingJoin; pendingJoin = ""; store.set("hl-join", "");
+  const { data, error } = await sb.rpc("join_group", { p_code: code });
+  if (error) { toast(errMsg(error).includes("No group") ? "That invite link isn't valid anymore. Ask for a new one." : errMsg(error)); return false; }
+  store.set("hl-group", data.id);
+  toast(`You're in ${data.name}`);
+  return true;
+}
+async function shareInvite() {
+  const g = group(); if (!g) return;
+  const url = inviteLink(g.invite_code), text = `Join ${g.name} on House Line`;
+  try {
+    if (navigator.share) { await navigator.share({ title: "House Line", text, url }); return; }
+  } catch (e) { if (e?.name === "AbortError") return; }
+  try { await navigator.clipboard.writeText(url); toast("Invite link copied"); }
+  catch { sheet(`<h4>Invite link</h4><input class="inp" id="inv-url" readonly value="${esc(url)}"><span class="hint">Press and hold to copy.</span><button class="btn big" data-close>Done</button>`); $("#inv-url").select(); }
+}
+
 /* ---------------- data ---------------- */
 
 async function loadGroups() {
+  await usePendingJoin();
   const { data, error } = await sb.from("memberships")
     .select("group_id, groups(id, name, invite_code, owner_id, starting_balance, creator_can_bet)").eq("user_id", uid());
   if (error) { toast(errMsg(error)); return; }
@@ -261,8 +297,13 @@ function setupHTML() {
 
 function authHTML() {
   const up = state.authMode === "signup";
+  const inv = state.invite;
+  const banner = pendingJoin && inv && !inv.bad
+    ? `<div class="invite-banner"><small>You're invited to</small><b>${esc(inv.name)}</b><span>${inv.members > 1 ? `${esc(inv.owner)} and ${inv.members - 1 === 1 ? "1 other" : `${inv.members - 1} others`} are betting.` : `Started by ${esc(inv.owner)}.`} ${up ? "Create an account" : "Sign in"} to join.</span></div>`
+    : pendingJoin && inv?.bad ? `<div class="invite-banner bad"><b>That invite link isn't valid anymore.</b><span>Ask whoever sent it for a new one.</span></div>` : "";
   return `<h1>House<span>Line</span></h1>
   <p class="lede">Make lines. Take action. Play money only.</p>
+  ${banner}
   <form class="form" id="authForm">
     ${up ? `<label class="f" for="a-user">Username<input class="inp" id="a-user" autocomplete="username" maxlength="20" placeholder="benny" required></label>` : ""}
     <label class="f" for="a-email">Email<input class="inp" id="a-email" type="email" autocomplete="email" required></label>
@@ -680,7 +721,7 @@ function leadersHTML() {
   const g = group();
   const rows = [...state.members].sort((a, b) => b.balance - a.balance);
   const invite = (g && g.owner_id === uid() ? `<button class="btn settings-link" id="openSettings">⚙ Group settings</button>` : "") + (g ? `<div class="invite"><div><small>Invite code</small><b>${esc(g.invite_code)}</b></div>
-    <button class="btn" id="copyCode">Copy</button></div>` : "");
+    <div class="invite-acts"><button class="btn primary" id="shareInvite">Share link</button><button class="btn" id="copyCode">Copy code</button></div></div>` : "");
   return `<h2>Leaderboard</h2>${invite}<div class="list">${rows.map((r, i) => {
     const rec = recordOf(r.id);
     return `<div class="row"><div class="rank num">${i + 1}</div>${avatarHTML(r.id, 34)}
@@ -1058,7 +1099,7 @@ function settingsHTML() {
   return `${back}<h2>Group settings</h2>
   <section class="set-block"><h3>Group</h3>
     <label class="f" for="set-name">Name<div class="inline"><input class="inp" id="set-name" maxlength="60" value="${esc(g.name)}"><button class="btn" data-set="rename">Save</button></div></label>
-    <div class="f">Invite code<div class="inline"><b class="code-show">${esc(g.invite_code)}</b><button class="btn" data-set="newcode">New code</button></div>
+    <div class="f">Invite code<div class="inline"><b class="code-show">${esc(g.invite_code)}</b><button class="btn" id="shareInvite">Share link</button><button class="btn" data-set="newcode">New code</button></div>
       <span class="hint">A new code stops the old one from working. People already in stay in.</span></div>
     <label class="toggle-row" for="set-ownbet"><span><b>Line creators can bet on their own lines</b><small>Off: whoever posts a line sits it out. Props about yourself are always off-limits.</small></span>
       <input type="checkbox" class="switch" id="set-ownbet" data-group-toggle="creator_can_bet" ${g.creator_can_bet ? "checked" : ""}></label>
@@ -1537,6 +1578,7 @@ document.addEventListener("click", async e => {
   const t = e.target.closest("button"); if (!t) return;
   if (t.id === "signOut") { closeSheet(); await pauseThisDevice(); await sb.auth.signOut(); return; }
   if (t.id === "a-toggle") { state.authMode = state.authMode === "signup" ? "signin" : "signup"; return render(); }
+  if (t.id === "shareInvite") return shareInvite();
   if (t.id === "copyCode") {
     const code = group()?.invite_code || "";
     try { await navigator.clipboard.writeText(code); toast("Invite code copied"); } catch { toast(`Code: ${code}`); }
@@ -1612,7 +1654,7 @@ document.addEventListener("submit", async e => {
     if (state.authMode === "signup") {
       const username = $("#a-user").value.trim();
       if (!/^[A-Za-z0-9_]{2,20}$/.test(username)) { busy(false); return (err.textContent = "Username: 2–20 letters, numbers, or underscores."); }
-      const { data, error } = await sb.auth.signUp({ email, password, options: { data: { username } } });
+      const { data, error } = await sb.auth.signUp({ email, password, options: { data: pendingJoin ? { username, join_code: pendingJoin } : { username } } });
       busy(false);
       if (error) return (err.textContent = errMsg(error));
       if (!data.session) { err.className = "ok"; err.textContent = "Check your email for a confirmation link, then sign in."; state.authMode = "signin"; }

@@ -1621,3 +1621,5 @@ alter publication supabase_realtime add table public.profiles;
 -- Editing bets: see the project migration "edit_bet" (bets.edited_at, public.edit_bet).
 -- Photo-proof count updates + live count notifications: see migrations "self_count_with_photo",
 -- "live_count_notifications", "live_count_notifications_fix", "fix_is_subject_null".
+-- Invite links (?join=CODE): see migration "invite_links" (group_preview for signed-out visitors;
+-- handle_new_user joins the group when sign-up metadata has join_code).

@@ -416,3 +416,13 @@ details.day[open] > .list{padding-bottom:6px}
 .proof-item b{font-family:var(--display);font-size:22px}
 .proof-item span{font-size:13px;color:var(--muted)}
 .note-icon.live{color:var(--loss)}
+
+/* invite links */
+.invite{flex-wrap:wrap}
+.invite-acts{display:flex;gap:8px}
+.invite-banner{background:var(--felt-soft);border-radius:14px;padding:14px 16px;margin-bottom:16px;display:flex;flex-direction:column;gap:2px}
+.invite-banner small{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.invite-banner b{font-family:var(--display);font-size:28px;text-transform:uppercase;letter-spacing:.03em;color:var(--felt);line-height:1.1}
+.invite-banner span{font-size:14px;color:var(--ink)}
+.invite-banner.bad{background:var(--loss-soft)}
+.invite-banner.bad b{font-family:var(--body);font-size:16px;text-transform:none;letter-spacing:0;color:var(--loss)}
