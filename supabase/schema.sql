@@ -1623,3 +1623,4 @@ alter publication supabase_realtime add table public.profiles;
 -- "live_count_notifications", "live_count_notifications_fix", "fix_is_subject_null".
 -- Invite links (?join=CODE): see migration "invite_links" (group_preview for signed-out visitors;
 -- handle_new_user joins the group when sign-up metadata has join_code).
+-- Comments: see migration "bet_comments" (bet_comments table, add_comment / delete_comment RPCs).

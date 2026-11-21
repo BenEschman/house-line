@@ -196,13 +196,14 @@ async function openGroup(id) {
 
 async function loadGroupData() {
   const gid = state.groupId; if (!gid) return;
-  const [bets, wagers, members, hidden, props, counts] = await Promise.all([
+  const [bets, wagers, members, hidden, props, counts, comments] = await Promise.all([
     sb.from("bets").select("*, outcomes!outcomes_bet_id_fkey(id, label, odds, open_odds, position)").eq("group_id", gid).order("created_at", { ascending: false }).limit(300),
     sb.from("wagers").select("*").eq("group_id", gid).limit(5000),
     sb.from("memberships").select("user_id, balance, profiles(username, avatar)").eq("group_id", gid),
     sb.from("bet_hidden").select("bet_id, user_id").eq("group_id", gid),
     sb.from("props").select("*").eq("group_id", gid).order("created_at"),
     sb.from("count_updates").select("id, bet_id, user_id, value, has_photo, created_at").eq("group_id", gid).order("created_at", { ascending: false }).limit(500),
+    sb.from("bet_comments").select("id, bet_id, user_id, body, created_at").eq("group_id", gid).order("created_at").limit(2000),
   ]);
   if (gid !== state.groupId) return;
   const err = bets.error || wagers.error || members.error;
@@ -212,6 +213,8 @@ async function loadGroupData() {
   state.members = (members.data || []).map(m => ({ id: m.user_id, balance: Number(m.balance), username: m.profiles?.username || "player", avatar: m.profiles?.avatar || null }));
   state.props = props.data || [];
   state.counts = counts?.data || [];
+  state.comments = comments?.data || [];
+  if (commentsOpen) renderComments();
   state.hidden = {};
   for (const h of hidden.data || []) (state.hidden[h.bet_id] ||= []).push(h.user_id);
   state.loaded = true;
@@ -225,7 +228,7 @@ function scheduleReload() { clearTimeout(reloadTimer); reloadTimer = setTimeout(
 function subscribe(gid) {
   if (state.channel) sb.removeChannel(state.channel);
   const ch = sb.channel("group-" + gid);
-  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props", "profiles", "count_updates"])
+  for (const table of ["bets", "outcomes", "wagers", "memberships", "bet_hidden", "props", "profiles", "count_updates", "bet_comments"])
     ch.on("postgres_changes", table === "profiles" ? { event: "*", schema: "public", table } : { event: "*", schema: "public", table, filter: `group_id=eq.${gid}` }, scheduleReload);
   ch.subscribe();
   state.channel = ch;
@@ -435,6 +438,7 @@ function betCard(b) {
       ${liveBar(b, live)}
     </div>
     <div class="outs">${outs}</div>${ctl}
+    ${commentBar(b)}
   </article>`;
 }
 
@@ -730,13 +734,70 @@ function leadersHTML() {
   }).join("")}</div>`;
 }
 
+/* ---------------- comments ---------------- */
+
+const commentsFor = id => (state.comments || []).filter(c => c.bet_id === id);
+function commentBar(b) {
+  const list = commentsFor(b.id), last = list[list.length - 1];
+  return `<button class="cmt-bar" data-comments="${esc(b.id)}" aria-label="Comments on this bet">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/></svg>
+    ${list.length ? `<b class="num">${list.length}</b><span class="cmt-last"><b>${esc(nameOf(last.user_id))}:</b> ${esc(last.body)}</span>` : `<span class="cmt-last">Add a comment</span>`}
+  </button>`;
+}
+let commentsOpen = null;
+function renderComments() {
+  const box = $("#cmt-list"); if (!box || !commentsOpen) return;
+  const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+  const owner = group()?.owner_id === uid();
+  box.innerHTML = commentsFor(commentsOpen).map(c => `<div class="cmt${c.user_id === uid() ? " me" : ""}">
+      ${avatarHTML(c.user_id, 28)}
+      <div class="cmt-body"><div class="cmt-who"><b>${esc(nameOf(c.user_id))}</b><small>${agoText(c.created_at)}</small>
+        ${c.user_id === uid() || owner ? `<button class="cmt-del" data-del-comment="${esc(c.id)}" aria-label="Delete comment">Delete</button>` : ""}</div>
+        <p>${esc(c.body)}</p></div>
+    </div>`).join("") || `<small class="cmt-empty">No comments yet. Start the trash talk.</small>`;
+  if (atBottom) box.scrollTop = box.scrollHeight;
+  box.querySelectorAll("[data-del-comment]").forEach(btn => btn.onclick = async () => {
+    btn.disabled = true;
+    const { error } = await sb.rpc("delete_comment", { p_comment: btn.dataset.delComment });
+    if (error) { btn.disabled = false; return toast(errMsg(error)); }
+    state.comments = state.comments.filter(c => c.id !== btn.dataset.delComment); renderComments(); render();
+  });
+}
+function openComments(betId) {
+  const b = betById(betId); if (!b) return;
+  sheet(`<h4>Comments · ${esc(betTitle(b))}</h4>
+    <div class="cmt-list" id="cmt-list"></div>
+    <div class="cmt-compose">
+      <textarea class="inp" id="cmt-in" rows="2" maxlength="500" placeholder="Say something…"></textarea>
+      <button class="btn primary" id="cmt-send">Send</button>
+    </div>
+    <div class="err" id="cmt-err"></div>
+    <button class="btn big" data-close>Close</button>`);
+  commentsOpen = betId;
+  renderComments();
+  const box = $("#cmt-list"); box.scrollTop = box.scrollHeight;
+  const send = async () => {
+    const body = $("#cmt-in").value.trim(); if (!body) return;
+    $("#cmt-send").disabled = true; $("#cmt-err").textContent = "";
+    const { data, error } = await sb.rpc("add_comment", { p_bet: betId, p_body: body });
+    $("#cmt-send").disabled = false;
+    if (error) return ($("#cmt-err").textContent = errMsg(error));
+    $("#cmt-in").value = "";
+    const row = Array.isArray(data) ? data[0] : data;
+    if (row?.id && !state.comments.some(c => c.id === row.id)) state.comments.push(row);
+    renderComments(); $("#cmt-list").scrollTop = $("#cmt-list").scrollHeight; render();
+  };
+  $("#cmt-send").onclick = send;
+  $("#cmt-in").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } });
+}
+
 /* ---------------- sheets ---------------- */
 
 function sheet(html) {
   $("#sheetHost").innerHTML = `<div class="scrim" id="scrim"><div class="sheet" role="dialog" aria-modal="true"><div class="grab"></div>${html}</div></div>`;
   $("#scrim").addEventListener("click", e => { if (e.target.id === "scrim" || e.target.closest("[data-close]")) closeSheet(); });
 }
-function closeSheet() { $("#sheetHost").innerHTML = ""; }
+function closeSheet() { $("#sheetHost").innerHTML = ""; commentsOpen = null; }
 
 function openWager(betId, outId) {
   const b = betById(betId); const o = b?.outcomes.find(x => x.id === outId);
@@ -1367,6 +1428,7 @@ async function openCashOut(wagerId) {
 
 const VAPID_PUBLIC = "BGewTeQH_00NJL5k1zEEzQB8dMu5sEcmr4jb4ycVOyR4OSOeqpnAkpDpd4o1IMIEyw5IrtxbQKC9c6Gxi5gIpEA";
 const NOTIFY_KINDS = [
+  ["comment", "Comments", "Comments on bets you posted, bet on, or commented on."],
   ["live", "Live counts", "Count updates on bets you're in. One notification per bet that updates in place."],
   ["new_line", "New lines", "When someone posts a line in your group"],
   ["result", "Results", "When a bet you're in settles or is voided"],
@@ -1375,6 +1437,7 @@ const NOTIFY_KINDS = [
   ["joined", "New members", "When someone joins a group you own"],
 ];
 const KIND_ICON = {
+  comment: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
   live: '<circle cx="12" cy="12" r="3"/><path d="M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/>',
   result: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/>',
   new_line: '<path d="M12 5v14M5 12h14"/>',
@@ -1439,7 +1502,7 @@ async function openNotification(id) {
   const n = state.notifs.find(x => x.id === id); if (!n) return;
   if (n.group_id && n.group_id !== state.groupId && state.groups.some(g => g.id === n.group_id)) await openGroup(n.group_id);
   if (n.kind === "joined") { state.tab = "leaders"; return render(); }
-  if (n.bet_id) return goToBet(n.bet_id);
+  if (n.bet_id) { goToBet(n.bet_id); if (n.kind === "comment" && betById(n.bet_id)) setTimeout(() => openComments(n.bet_id), 400); return; }
   // Collapsed "N new lines" notifications have no single bet: open the tab they're about.
   state.tab = n.kind === "new_line" && (n.data?.count ?? 1) > 1 && state.props.length ? "props" : "board";
   state.filter = "open"; render();
@@ -1635,6 +1698,7 @@ document.addEventListener("click", async e => {
   if (t.dataset.act === "edit") return openEdit(t.dataset.bet);
   if (t.dataset.act === "selfcount") return openSelfCount(t.dataset.bet);
   if (t.dataset.proof) return openProof(t.dataset.proof);
+  if (t.dataset.comments) return openComments(t.dataset.comments);
   if (t.dataset.act === "void") return openVoid(t.dataset.bet);
   if (t.dataset.act === "lock" || t.dataset.act === "reopen") {
     const { error } = await sb.rpc("set_bet_status", { p_bet: t.dataset.bet, p_status: t.dataset.act === "lock" ? "locked" : "open" });
