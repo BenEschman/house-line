@@ -313,6 +313,7 @@ function authHTML() {
     <label class="f" for="a-pass">Password<input class="inp" id="a-pass" type="password" autocomplete="${up ? "new-password" : "current-password"}" minlength="6" required></label>
     <div class="err" id="a-err"></div>
     <button class="btn primary big" type="submit">${up ? "Create account" : "Sign in"}</button>
+    ${up ? "" : `<button class="btn link" type="button" id="a-forgot">Forgot password?</button>`}
     <button class="btn link" type="button" id="a-toggle">${up ? "Have an account? Sign in" : "New here? Create an account"}</button>
   </form>`;
 }
@@ -1172,6 +1173,7 @@ function settingsHTML() {
         <div class="acts">
           <button class="btn" data-set="tokens" data-user="${esc(m.id)}">Tokens</button>
           ${m.id !== uid() ? `<button class="btn" data-set="owner" data-user="${esc(m.id)}">Make owner</button>
+          <button class="btn" data-set="resetpw" data-user="${esc(m.id)}">Reset password</button>
           <button class="btn danger" data-set="remove" data-user="${esc(m.id)}">Remove</button>` : ""}
         </div></div>`).join("")}</div>
   </section>
@@ -1220,6 +1222,19 @@ async function settingsAction(t) {
     return "";
   };
   const inline = async (fn, args, ok) => { const m = await call(fn, args, ok); if (m) toast(m); };
+  if (act === "resetpw") {
+    t.disabled = true;
+    const { data, error } = await sb.rpc("create_reset_code", { p_group: gid, p_user: who });
+    t.disabled = false;
+    if (error) return toast(errMsg(error));
+    sheet(`<h4>Reset code for ${esc(name)}</h4>
+      <div class="reset-code num">${esc(data.slice(0, 4))}-${esc(data.slice(4))}</div>
+      <p class="hint">Send this to ${esc(name)}. On the sign-in screen they tap <b>Forgot password?</b>, then <b>I have a code</b>, and pick a new password. It works once and expires in 30 minutes. Making a new code cancels this one.</p>
+      <button class="btn primary big" id="rc-copy">Copy code</button>
+      <button class="btn big" data-close>Done</button>`);
+    $("#rc-copy").onclick = async () => { try { await navigator.clipboard.writeText(data); toast("Code copied"); } catch { toast(`Code: ${data}`); } };
+    return;
+  }
   if (act === "rename") return inline("rename_group", { p_group: gid, p_name: $("#set-name").value }, "Group renamed");
   if (act === "newcode") return confirmSheet("New invite code?", `The current code <b>${esc(g.invite_code)}</b> stops working. Everyone already in the group stays.`, "Make new code", false,
     () => call("new_invite_code", { p_group: gid }, c => `New code: ${c}`));
@@ -1351,8 +1366,8 @@ document.addEventListener("change", async e => {
   e.target.value = "";
 });
 
-function openPassword() {
-  sheet(`<h4>Change password</h4>
+function openPassword(recovery = false) {
+  sheet(`<h4>${recovery ? "Set a new password" : "Change password"}</h4>
     <label class="f" for="pw-new">New password<input class="inp" id="pw-new" type="password" autocomplete="new-password" minlength="6"></label>
     <label class="f" for="pw-again">Type it again<input class="inp" id="pw-again" type="password" autocomplete="new-password" minlength="6"></label>
     <div class="err" id="pw-err"></div>
@@ -1366,6 +1381,49 @@ function openPassword() {
     const { error } = await sb.auth.updateUser({ password: a });
     if (error) { $("#pw-err").textContent = errMsg(error); $("#pw-save").disabled = false; return; }
     closeSheet(); toast("Password changed");
+  };
+}
+
+function openForgot(mode = "email") {
+  const email = $("#a-email")?.value.trim() || "";
+  const code = mode === "code";
+  sheet(`<h4>Forgot password</h4>
+    <div class="seg fp-tabs" role="group" aria-label="Reset method">
+      <button class="${code ? "" : "on"}" aria-pressed="${!code}" id="fp-email-tab">Email me a link</button>
+      <button class="${code ? "on" : ""}" aria-pressed="${code}" id="fp-code-tab">I have a code</button>
+    </div>
+    <label class="f" for="fp-email">Email<input class="inp" id="fp-email" type="email" autocomplete="email" value="${esc(email)}"></label>
+    ${code ? `<label class="f" for="fp-code">Code from your group owner<input class="inp code" id="fp-code" autocomplete="one-time-code" autocapitalize="characters" maxlength="9" placeholder="ABCD-2345"></label>
+      <label class="f" for="fp-pass">New password<input class="inp" id="fp-pass" type="password" autocomplete="new-password" minlength="6"></label>
+      <label class="f" for="fp-again">Type it again<input class="inp" id="fp-again" type="password" autocomplete="new-password" minlength="6"></label>`
+    : `<p class="hint">No email? Ask your group owner for a reset code: Group settings → your name → Reset password.</p>`}
+    <div class="err" id="fp-err"></div>
+    <button class="btn primary big" id="fp-go">${code ? "Set new password" : "Send reset link"}</button>
+    <button class="btn big" data-close>Cancel</button>`);
+  const keep = () => { const v = $("#fp-email").value; if ($("#a-email")) $("#a-email").value = v; };
+  $("#fp-email-tab").onclick = () => { keep(); openForgot("email"); };
+  $("#fp-code-tab").onclick = () => { keep(); openForgot("code"); };
+  const err = $("#fp-err"), go = $("#fp-go");
+  go.onclick = async () => {
+    const em = $("#fp-email").value.trim(); err.className = "err"; err.textContent = "";
+    if (!/^\S+@\S+\.\S+$/.test(em)) return (err.textContent = "Enter the email you signed up with.");
+    if (!code) {
+      go.disabled = true;
+      const { error } = await sb.auth.resetPasswordForEmail(em, { redirectTo: location.origin + location.pathname });
+      go.disabled = false;
+      if (error) return (err.textContent = /not authorized/i.test(error.message) ? "Email can't be sent to that address yet. Ask your group owner for a reset code instead." : errMsg(error));
+      err.className = "ok"; err.textContent = "If that email has an account, a reset link is on its way. Open it on this device.";
+      return;
+    }
+    const c = $("#fp-code").value, a = $("#fp-pass").value, b = $("#fp-again").value;
+    if (c.replace(/[^A-Za-z0-9]/g, "").length < 8) return (err.textContent = "The code is 8 characters.");
+    if (a.length < 6) return (err.textContent = "Use at least 6 characters.");
+    if (a !== b) return (err.textContent = "Those passwords don't match.");
+    go.disabled = true;
+    const { data, error } = await sb.rpc("reset_password_with_code", { p_email: em, p_code: c, p_password: a });
+    if (error || data) { go.disabled = false; return (err.textContent = error ? errMsg(error) : data); }
+    const { error: e2 } = await sb.auth.signInWithPassword({ email: em, password: a });
+    closeSheet(); toast(e2 ? "Password reset. Sign in with your new password." : "Password reset. You're signed in.");
   };
 }
 
@@ -1640,6 +1698,7 @@ $("#app").addEventListener("input", e => { if (state.tab === "create" && e.targe
 document.addEventListener("click", async e => {
   const t = e.target.closest("button"); if (!t) return;
   if (t.id === "signOut") { closeSheet(); await pauseThisDevice(); await sb.auth.signOut(); return; }
+  if (t.id === "a-forgot") return openForgot();
   if (t.id === "a-toggle") { state.authMode = state.authMode === "signup" ? "signin" : "signup"; return render(); }
   if (t.id === "shareInvite") return shareInvite();
   if (t.id === "copyCode") {
@@ -1822,10 +1881,16 @@ setInterval(() => {
 }, 30000);
 
 render();
+if (/error_code=/.test(location.hash)) {
+  const h = new URLSearchParams(location.hash.slice(1));
+  setTimeout(() => toast(h.get("error_code") === "otp_expired" ? "That reset link expired or was already used. Request a new one." : (h.get("error_description") || "That link didn't work.").replace(/\+/g, " ")), 400);
+  history.replaceState(null, "", location.pathname);
+}
 if (sb) {
   sb.auth.onAuthStateChange((event, session) => {
     const was = uid();
     state.session = session;
+    if (event === "PASSWORD_RECOVERY") setTimeout(() => { history.replaceState(null, "", location.pathname); openPassword(true); }, 300);
     if (!session) {
       if (state.channel) sb.removeChannel(state.channel);
       Object.assign(state, { groups: [], groupId: null, bets: [], wagers: [], members: [], channel: null });

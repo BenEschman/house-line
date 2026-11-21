@@ -445,3 +445,8 @@ details.day[open] > .list{padding-bottom:6px}
 .cmt-compose{display:flex;gap:8px;align-items:flex-end}
 .cmt-compose textarea{flex:1;font-family:var(--body);resize:none;font-size:16px;min-height:44px}
 .cmt-compose .btn{min-height:44px}
+
+/* password reset code */
+.reset-code{font-family:var(--display);font-size:44px;font-weight:700;letter-spacing:.12em;text-align:center;padding:14px 0;margin:6px 0 10px;border:2px dashed var(--line);border-radius:14px;user-select:all}
+.sheet .seg{flex-shrink:0}
+.sheet .seg.fp-tabs{margin-bottom:6px}

@@ -1624,3 +1624,4 @@ alter publication supabase_realtime add table public.profiles;
 -- Invite links (?join=CODE): see migration "invite_links" (group_preview for signed-out visitors;
 -- handle_new_user joins the group when sign-up metadata has join_code).
 -- Comments: see migration "bet_comments" (bet_comments table, add_comment / delete_comment RPCs).
+-- Password reset codes: see migration "password_reset_codes" (owner-made one-time codes; private.reset_codes, create_reset_code, reset_password_with_code).
