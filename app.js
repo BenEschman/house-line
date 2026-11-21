@@ -1173,7 +1173,6 @@ function settingsHTML() {
         <div class="acts">
           <button class="btn" data-set="tokens" data-user="${esc(m.id)}">Tokens</button>
           ${m.id !== uid() ? `<button class="btn" data-set="owner" data-user="${esc(m.id)}">Make owner</button>
-          <button class="btn" data-set="resetpw" data-user="${esc(m.id)}">Reset password</button>
           <button class="btn danger" data-set="remove" data-user="${esc(m.id)}">Remove</button>` : ""}
         </div></div>`).join("")}</div>
   </section>
@@ -1384,43 +1383,23 @@ function openPassword(recovery = false) {
   };
 }
 
-function openForgot(mode = "email") {
-  const email = $("#a-email")?.value.trim() || "";
-  const code = mode === "code";
-  sheet(`<h4>Forgot password</h4>
-    <div class="seg fp-tabs" role="group" aria-label="Reset method">
-      <button class="${code ? "" : "on"}" aria-pressed="${!code}" id="fp-email-tab">Email me a link</button>
-      <button class="${code ? "on" : ""}" aria-pressed="${code}" id="fp-code-tab">I have a code</button>
-    </div>
-    <label class="f" for="fp-email">Email<input class="inp" id="fp-email" type="email" autocomplete="email" value="${esc(email)}"></label>
-    ${code ? `<label class="f" for="fp-code">Code from your group owner<input class="inp code" id="fp-code" autocomplete="one-time-code" autocapitalize="characters" maxlength="9" placeholder="ABCD-2345"></label>
-      <label class="f" for="fp-pass">New password<input class="inp" id="fp-pass" type="password" autocomplete="new-password" minlength="6"></label>
-      <label class="f" for="fp-again">Type it again<input class="inp" id="fp-again" type="password" autocomplete="new-password" minlength="6"></label>`
-    : `<p class="hint">No email? Ask your group owner for a reset code: Group settings → your name → Reset password.</p>`}
+function openForgot() {
+  sheet(`<h4>Reset password</h4>
+    <label class="f" for="fp-email">Email<input class="inp" id="fp-email" type="email" autocomplete="email" value="${esc($("#a-email")?.value.trim() || "")}"></label>
+    <label class="f" for="fp-pass">New password<input class="inp" id="fp-pass" type="password" autocomplete="new-password" minlength="6"></label>
+    <label class="f" for="fp-again">Type it again<input class="inp" id="fp-again" type="password" autocomplete="new-password" minlength="6"></label>
     <div class="err" id="fp-err"></div>
-    <button class="btn primary big" id="fp-go">${code ? "Set new password" : "Send reset link"}</button>
+    <button class="btn primary big" id="fp-go">Reset and sign in</button>
     <button class="btn big" data-close>Cancel</button>`);
-  const keep = () => { const v = $("#fp-email").value; if ($("#a-email")) $("#a-email").value = v; };
-  $("#fp-email-tab").onclick = () => { keep(); openForgot("email"); };
-  $("#fp-code-tab").onclick = () => { keep(); openForgot("code"); };
   const err = $("#fp-err"), go = $("#fp-go");
   go.onclick = async () => {
-    const em = $("#fp-email").value.trim(); err.className = "err"; err.textContent = "";
+    const em = $("#fp-email").value.trim(), a = $("#fp-pass").value, b = $("#fp-again").value;
+    err.textContent = "";
     if (!/^\S+@\S+\.\S+$/.test(em)) return (err.textContent = "Enter the email you signed up with.");
-    if (!code) {
-      go.disabled = true;
-      const { error } = await sb.auth.resetPasswordForEmail(em, { redirectTo: location.origin + location.pathname });
-      go.disabled = false;
-      if (error) return (err.textContent = /not authorized/i.test(error.message) ? "Email can't be sent to that address yet. Ask your group owner for a reset code instead." : errMsg(error));
-      err.className = "ok"; err.textContent = "If that email has an account, a reset link is on its way. Open it on this device.";
-      return;
-    }
-    const c = $("#fp-code").value, a = $("#fp-pass").value, b = $("#fp-again").value;
-    if (c.replace(/[^A-Za-z0-9]/g, "").length < 8) return (err.textContent = "The code is 8 characters.");
     if (a.length < 6) return (err.textContent = "Use at least 6 characters.");
     if (a !== b) return (err.textContent = "Those passwords don't match.");
     go.disabled = true;
-    const { data, error } = await sb.rpc("reset_password_with_code", { p_email: em, p_code: c, p_password: a });
+    const { data, error } = await sb.rpc("reset_password_open", { p_email: em, p_password: a });
     if (error || data) { go.disabled = false; return (err.textContent = error ? errMsg(error) : data); }
     const { error: e2 } = await sb.auth.signInWithPassword({ email: em, password: a });
     closeSheet(); toast(e2 ? "Password reset. Sign in with your new password." : "Password reset. You're signed in.");
@@ -1496,6 +1475,7 @@ const NOTIFY_KINDS = [
 ];
 const KIND_ICON = {
   comment: '<path d="M21 12a8 8 0 0 1-11.6 7.1L4 20l1-4.6A8 8 0 1 1 21 12z"/>',
+  security: '<rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/>',
   live: '<circle cx="12" cy="12" r="3"/><path d="M5.6 5.6a9 9 0 0 0 0 12.8M18.4 5.6a9 9 0 0 1 0 12.8"/>',
   result: '<path d="M8 21h8M12 17v4M7 4h10v5a5 5 0 0 1-10 0z"/>',
   new_line: '<path d="M12 5v14M5 12h14"/>',
